@@ -364,7 +364,7 @@ public sealed class DeviceRepository
                 new HashEntry("TIMESTAMP", sampleTimestamp?.ToString() ?? string.Empty),
                 new HashEntry("Payload", rawPayload),
                 new HashEntry("ReceivedAtUtc", now.ToString("O"))
-            ]);
+            ]); 
 
         await _redis.HashSetAsync(
             RedisKeys.DeviceRuntime(deviceId),
