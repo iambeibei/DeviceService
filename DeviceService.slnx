@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/解决方案项/">
+    <File Path="CLAUDE.md" />
+  </Folder>
+  <Project Path="Bluetti.Device.Redis/Bluetti.Device.Redis.csproj" />
+  <Project Path="DeviceService/DeviceService.csproj" />
+</Solution>
