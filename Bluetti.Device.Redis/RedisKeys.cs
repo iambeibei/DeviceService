@@ -2,22 +2,64 @@ namespace Bluetti.Device.Redis;
 
 /// <summary>
 /// Redis 键统一定义。设备数据均以 DeviceId 作为隔离维度。
-/// 上线/下线结构保持原项目格式：
-/// 1. lgw:devices:online 为 List，元素为 {"id":"...","type":"..."}
-/// 2. lgw:device:{deviceId}:runtime 为设备运行状态 Hash。
+/// 在线结构：
+/// 1. lgw:devices:online 为全量 List，元素为 {"id":"...","type":"...","AgingNumber":"0"|null}
+/// 2. lgw:devices:online:aging:{AgingNumber} 为各架 type=1 点位 List；online:control 为 type=2 总控 List。
+/// 3. lgw:device:{deviceId}:runtime 为设备运行状态 Hash。
 /// </summary>
 public static class RedisKeys
 {
     public const string Prefix = "lgw";
 
-    // 原有设备目录及在线列表格式。
+    //消息频道
+    public const string channelFault = "event:fault"; // 故障频道
+    public const string channelWarn = "event:warn";   // 告警频道
+
+
+    // 设备目录及在线列表。
     public const string DeviceSet = $"{Prefix}:devices";
     public const string DeviceLastSeen = $"{Prefix}:devices:last_seen";
     public const string OnlineDeviceList = $"{Prefix}:devices:online";
+    public const string ControlOnlineDeviceList = $"{Prefix}:devices:online:control";
+
+    public static string AgingRackOnlineDeviceList(string agingNumber)
+        => $"{Prefix}:devices:online:aging:{NormalizeAgingNumber(agingNumber)}";
 
     // 命令基础设施。
     public const string CommandSequence = $"{Prefix}:cmd:seq";
     public const string CommandQueue = $"{Prefix}:cmd:queue";
+
+    // 多老化架群控状态。旧版无架号键保留在 Redis 中，但新代码不读取也不删除。
+    public const string GroupControlRacks = $"{Prefix}:group-control:racks";
+
+    public static string GroupControlState(string agingNumber)
+        => $"{Prefix}:group-control:{NormalizeAgingNumber(agingNumber)}:state";
+
+    public static string GroupControlCompletedDevices(string agingNumber)
+        => $"{Prefix}:group-control:{NormalizeAgingNumber(agingNumber)}:completed";
+
+    public static string GroupControlLastTaskSeq(string agingNumber)
+        => $"{Prefix}:group-control:{NormalizeAgingNumber(agingNumber)}:taskcp:last-seq";
+
+    public static string GroupControlRunState(string agingNumber, long runSeq)
+    {
+        if (runSeq <= 0)
+            throw new ArgumentOutOfRangeException(nameof(runSeq), "群控批次序号必须大于 0");
+
+        return $"{Prefix}:group-control:{NormalizeAgingNumber(agingNumber)}:run:{runSeq}:state";
+    }
+
+    public static string GroupControlRunParticipants(string agingNumber, long runSeq)
+        => $"{GroupControlRunRoot(agingNumber, runSeq)}:participants";
+
+    public static string GroupControlRunStartedDevices(string agingNumber, long runSeq)
+        => $"{GroupControlRunRoot(agingNumber, runSeq)}:started";
+
+    public static string GroupControlRunCompletedDevices(string agingNumber, long runSeq)
+        => $"{GroupControlRunRoot(agingNumber, runSeq)}:completed";
+
+    public static string GroupControlRunTerminalDevices(string agingNumber, long runSeq)
+        => $"{GroupControlRunRoot(agingNumber, runSeq)}:terminal";
 
     // 原有全局设备事件流，仅用于保持上线/下线处理格式。
     public const string DeviceEventStream = $"{Prefix}:device:events";
@@ -106,6 +148,30 @@ public static class RedisKeys
             throw new ArgumentException("DeviceId 不能包含冒号、斜杠或空白字符", nameof(deviceId));
 
         return value;
+    }
+
+    public static string NormalizeAgingNumber(string agingNumber)
+    {
+        if (string.IsNullOrWhiteSpace(agingNumber))
+            throw new ArgumentException("AgingNumber 不能为空", nameof(agingNumber));
+
+        var value = agingNumber.Trim();
+        if (!string.Equals(value, agingNumber, StringComparison.Ordinal) ||
+            value.Any(ch => ch is < '0' or > '9') ||
+            !int.TryParse(value, out var number) || number < 0)
+            throw new ArgumentException(
+                "AgingNumber 必须是非负整数格式的字符串",
+                nameof(agingNumber));
+
+        return number.ToString();
+    }
+
+    private static string GroupControlRunRoot(string agingNumber, long runSeq)
+    {
+        if (runSeq <= 0)
+            throw new ArgumentOutOfRangeException(nameof(runSeq), "群控批次序号必须大于 0");
+
+        return $"{Prefix}:group-control:{NormalizeAgingNumber(agingNumber)}:run:{runSeq}";
     }
 
     private static string NormalizeSegment(string value, string parameterName)

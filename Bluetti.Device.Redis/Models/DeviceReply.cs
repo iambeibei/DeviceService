@@ -15,6 +15,5 @@ public sealed class DeviceReply
     public int Code { get; set; }
     public string? Message { get; set; }
     public JToken? CmdData { get; set; }
-    public string Payload { get; set; } = string.Empty;
     public DateTime ReceivedAtUtc { get; set; }
 }

@@ -62,6 +62,7 @@ public sealed class CommandRepository
         return command;
     }
 
+    
     public Task EnsureGroupAsync()
         => _redis.EnsureConsumerGroupAsync(RedisKeys.CommandQueue, ConsumerGroup);
 

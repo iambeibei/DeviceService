@@ -8,7 +8,7 @@ namespace Bluetti.Device.Redis;
 
 /// <summary>
 /// 设备数据仓储。
-/// 上线/下线保持原项目的数据格式；配置、PN、状态、点位、事件、日志和老化数据
+/// 上线/下线维护全量、分架点位和总控在线列表；配置、PN、状态、点位、事件、日志和老化数据
 /// 继续保存到 lgw:device:{deviceId}:... 命名空间。
 /// </summary>
 public sealed class DeviceRepository
@@ -24,60 +24,69 @@ public sealed class DeviceRepository
 
     /// <summary>
     /// 保存子节点上线信息。
-    /// Redis 中使用原有统一 List；每个列表元素都是 JSON 字符串：
-    /// {"id":"100000010","type":"1"}
+    /// 全量在线 List 保持原键，并按 type/AgingNumber 同步维护分架点位列表和总控列表。
+    /// 每个列表元素都是 JSON 字符串：
+    /// {"id":"100000010","type":"1","AgingNumber":"0"}
     /// </summary>
-    public async Task SaveOnlineAsync(string deviceId,string deviceType,long? messageSeq = null)
+    public async Task SaveOnlineAsync(
+        string deviceId,
+        string deviceType,
+        string? agingNumber,
+        long? messageSeq = null)
     {
         deviceId = RedisKeys.Normalize(deviceId);
         deviceType = deviceType.Trim();
 
         if (string.IsNullOrWhiteSpace(deviceType))
             throw new ArgumentException("设备类型不能为空", nameof(deviceType));
+        if (agingNumber is not null)
+            agingNumber = RedisKeys.NormalizeAgingNumber(agingNumber);
+
+        var previous = await GetAsync(deviceId);
 
         var onlineJson = JsonConvert.SerializeObject(new
         {
             id = deviceId,
-            type = deviceType
+            type = deviceType,
+            AgingNumber = agingNumber
         });
 
-        // Redis List 本身不去重。
-        // 先查找并删除同一 id 的旧 JSON，再把最新 JSON 放到列表尾部。
-        var existingItems = await _redis.ListRangeAsync(RedisKeys.OnlineDeviceList);
-
-        foreach (var item in existingItems)
+        // 先移除同一设备的旧分类，支持设备重新上线时改变架号或类型。
+        await RemoveDeviceFromOnlineListAsync(RedisKeys.OnlineDeviceList, deviceId);
+        if (!string.IsNullOrWhiteSpace(previous?.AgingNumber))
         {
-            if (string.IsNullOrWhiteSpace(item))
-                continue;
-
-            try
-            {
-                var oldItem = JsonConvert.DeserializeObject<Dictionary<string, string>>(item);
-                if (oldItem is not null &&
-                    oldItem.TryGetValue("id", out var oldDeviceId) &&
-                    string.Equals(oldDeviceId, deviceId, StringComparison.Ordinal))
-                {
-                    await _redis.ListRemoveAsync(
-                        RedisKeys.OnlineDeviceList,
-                        item,
-                        count: 0);
-                }
-            }
-            catch (JsonException)
-            {
-                // 保留无法解析的历史元素，避免误删其他业务数据。
-            }
+            if (string.Equals(previous.DeviceType, "1", StringComparison.Ordinal))
+                await RemoveDeviceFromOnlineListAsync(
+                    RedisKeys.AgingRackOnlineDeviceList(previous.AgingNumber),
+                    deviceId);
+            else if (string.Equals(previous.DeviceType, "2", StringComparison.Ordinal))
+                await RemoveDeviceFromOnlineListAsync(
+                    RedisKeys.ControlOnlineDeviceList,
+                    deviceId);
         }
 
-        await _redis.ListRightPushAsync(
-            RedisKeys.OnlineDeviceList,
-            onlineJson);
+        await _redis.ListRightPushAsync(RedisKeys.OnlineDeviceList, onlineJson);
+
+        if (agingNumber is not null && string.Equals(deviceType, "1", StringComparison.Ordinal))
+        {
+            var rackList = RedisKeys.AgingRackOnlineDeviceList(agingNumber);
+            await RemoveDeviceFromOnlineListAsync(rackList, deviceId);
+            await _redis.ListRightPushAsync(rackList, onlineJson);
+        }
+        else if (agingNumber is not null && string.Equals(deviceType, "2", StringComparison.Ordinal))
+        {
+            await RemoveDeviceFromOnlineListAsync(RedisKeys.ControlOnlineDeviceList, deviceId);
+            await _redis.ListRightPushAsync(RedisKeys.ControlOnlineDeviceList, onlineJson);
+        }
 
         // 继续维护设备目录、最后活动时间和原有 runtime Hash。
         await MarkSeenAsync(deviceId, "up_line", messageSeq);
         await _redis.HashSetAsync(
             RedisKeys.DeviceRuntime(deviceId),
-            [new HashEntry("DeviceType", deviceType)]);
+            [
+                new HashEntry("DeviceType", deviceType),
+                new HashEntry("AgingNumber", agingNumber ?? string.Empty)
+            ]);
     }
 
     public async Task VersionSaveToRuntime(string deviceId,string version)
@@ -87,44 +96,14 @@ public sealed class DeviceRepository
 
 
     /// <summary>
-    /// 根据设备 ID 从在线 JSON String 列表中删除设备。
-    /// List 元素示例：{"id":"100000010","type":"1"}
+    /// 根据设备 ID 从全量及其所属分类在线列表中删除设备。
     /// </summary>
     public async Task<bool> RemoveOnlineDeviceAsync(string deviceId)
     {
         deviceId = RedisKeys.Normalize(deviceId);
-        var existingItems = await _redis.ListRangeAsync(RedisKeys.OnlineDeviceList);
-        var removed = false;
-
-        foreach (var item in existingItems)
-        {
-            if (string.IsNullOrWhiteSpace(item))
-                continue;
-
-            try
-            {
-                var oldItem = JsonConvert.DeserializeObject<Dictionary<string, string>>(item);
-                if (oldItem is null ||
-                    !oldItem.TryGetValue("id", out var oldDeviceId) ||
-                    !string.Equals(oldDeviceId, deviceId, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                var count = await _redis.ListRemoveAsync(
-                    RedisKeys.OnlineDeviceList,
-                    item,
-                    count: 0);
-
-                if (count > 0)
-                    removed = true;
-            }
-            catch (JsonException)
-            {
-                // 非法历史元素不参与按 ID 删除。
-            }
-        }
-
+        var existing = await GetAsync(deviceId);
+        var removed = await RemoveDeviceFromOnlineListAsync(RedisKeys.OnlineDeviceList, deviceId);
+        await RemoveDeviceFromClassifiedOnlineListAsync(existing, deviceId);
         return removed;
     }
 
@@ -145,10 +124,11 @@ public sealed class DeviceRepository
         if (string.IsNullOrWhiteSpace(deviceType))
             throw new ArgumentException("设备类型不能为空", nameof(deviceType));
 
-        var removed = await RemoveOnlineDeviceAsync(deviceId);
         var now = DateTime.UtcNow;
         var runtimeKey = RedisKeys.DeviceRuntime(deviceId);
         var existing = await _redis.HashToObjectAsync<DeviceNode>(runtimeKey);
+        var removed = await RemoveDeviceFromOnlineListAsync(RedisKeys.OnlineDeviceList, deviceId);
+        await RemoveDeviceFromClassifiedOnlineListAsync(existing, deviceId);
 
         var node = existing ?? new DeviceNode
         {
@@ -177,19 +157,71 @@ public sealed class DeviceRepository
             [new HashEntry("LastLifecyclePayload", rawPayload)]);
 
         // 保留原有全局离线事件 Stream 格式。
-        await _redis.StreamAddAsync(
-            RedisKeys.DeviceEventStream,
-            [
-                new NameValueEntry("deviceId", deviceId),
-                new NameValueEntry("event", "down_line"),
-                new NameValueEntry("type", deviceType),
-                new NameValueEntry("payload", rawPayload),
-                new NameValueEntry("removedFromOnlineList", removed ? "true" : "false"),
-                new NameValueEntry("receivedAtUtc", now.ToString("O"))
-            ],
-            maxLength: 100_000);
+        //await _redis.StreamAddAsync(
+        //    RedisKeys.DeviceEventStream,
+        //    [
+        //        new NameValueEntry("deviceId", deviceId),
+        //        new NameValueEntry("event", "down_line"),
+        //        new NameValueEntry("type", deviceType),
+        //        new NameValueEntry("payload", rawPayload),
+        //        new NameValueEntry("removedFromOnlineList", removed ? "true" : "false"),
+        //        new NameValueEntry("receivedAtUtc", now.ToString("O"))
+        //    ],
+        //    maxLength: 100_000);
 
         return removed;
+    }
+
+    private async Task<bool> RemoveDeviceFromOnlineListAsync(string listKey, string deviceId)
+    {
+        var existingItems = await _redis.ListRangeAsync(listKey);
+        var removed = false;
+
+        foreach (var item in existingItems)
+        {
+            if (string.IsNullOrWhiteSpace(item))
+                continue;
+
+            try
+            {
+                var json = JObject.Parse(item);
+                var oldDeviceId = json.GetValue("id", StringComparison.OrdinalIgnoreCase)?.Value<string>();
+                if (!string.Equals(oldDeviceId, deviceId, StringComparison.Ordinal))
+                    continue;
+
+                if (await _redis.ListRemoveAsync(listKey, item, count: 0) > 0)
+                    removed = true;
+            }
+            catch (JsonException)
+            {
+                // 非法历史元素不参与按 ID 删除，避免误删其他业务数据。
+            }
+        }
+
+        return removed;
+    }
+
+    private async Task RemoveDeviceFromClassifiedOnlineListAsync(
+        DeviceNode? device,
+        string deviceId)
+    {
+        if (string.IsNullOrWhiteSpace(device?.AgingNumber))
+            return;
+
+        var agingNumber = RedisKeys.NormalizeAgingNumber(device.AgingNumber);
+
+        if (string.Equals(device.DeviceType, "1", StringComparison.Ordinal))
+        {
+            await RemoveDeviceFromOnlineListAsync(
+                RedisKeys.AgingRackOnlineDeviceList(agingNumber),
+                deviceId);
+        }
+        else if (string.Equals(device.DeviceType, "2", StringComparison.Ordinal))
+        {
+            await RemoveDeviceFromOnlineListAsync(
+                RedisKeys.ControlOnlineDeviceList,
+                deviceId);
+        }
     }
 
     /// <summary>
@@ -283,6 +315,13 @@ public sealed class DeviceRepository
                     new HashEntry("AgingState", state ?? string.Empty),
                     new HashEntry("LastStatePayload", rawPayload)
                 ]);
+            var json = JObject.Parse(rawPayload);
+            if(json.SelectToken("Data.ProgramId")!= null)
+            {
+                var programId = json.SelectToken("Data.ProgramId").Value<string>();
+                await _redis.HashSetAsync(RedisKeys.DeviceEventLatest(deviceId, eventType),[new HashEntry("ProgramId", programId)]);
+            }
+
 
             // 注意：这里不再清 CurrentAgingSeq。
             // 状态处理器需要先通过 CurrentAgingSeq 找到命令 RecordId 并完成 API 回调，
@@ -496,6 +535,15 @@ public sealed class DeviceRepository
     public Task<string[]> GetOnlineDeviceJsonListAsync()
         => _redis.ListRangeAsync(RedisKeys.OnlineDeviceList, 0, -1);
 
+    public Task<string[]> GetAgingRackOnlineDeviceJsonListAsync(string agingNumber)
+        => _redis.ListRangeAsync(
+            RedisKeys.AgingRackOnlineDeviceList(agingNumber),
+            0,
+            -1);
+
+    public Task<string[]> GetControlOnlineDeviceJsonListAsync()
+        => _redis.ListRangeAsync(RedisKeys.ControlOnlineDeviceList, 0, -1);
+
     public Task<DeviceNode?> GetAsync(string deviceId)
         => _redis.HashToObjectAsync<DeviceNode>(RedisKeys.DeviceRuntime(deviceId));
 
@@ -643,7 +691,7 @@ public sealed class DeviceRepository
         var eventKey = RedisKeys.DeviceEventLatest(deviceId, "state");
         await _redis.HashSetAsync(
             eventKey,
-            [new HashEntry("CurrentAgingSeq", recordId)]);
+            [new HashEntry("CurrentAgingSeq", seqText)]);
         await _redis.HashSetIfNotExistsAsync(eventKey, "TaskQueue", "[]");
         await _redis.HashDeleteAsync(eventKey, "CompleteTasks");
         await _redis.HashDeleteAsync(eventKey, "TaskId");
@@ -667,6 +715,41 @@ public sealed class DeviceRepository
         return !raw.IsNullOrEmpty && long.TryParse(raw.ToString(), out var stateSeq) && stateSeq > 0
             ? stateSeq
             : null;
+    }
+
+    /// <summary>
+    /// 判断指定 start_aging Seq 是否仍属于设备当前或尚待发布的老化任务。
+    /// runtime 用于识别已经发布并运行的任务，TaskQueue 用于补齐服务重启或消息乱序时的候选批次。
+    /// </summary>
+    public async Task<bool> HasAgingTaskAsync(string deviceId, long seq)
+    {
+        if (seq <= 0)
+            throw new ArgumentOutOfRangeException(nameof(seq), "老化指令 Seq 必须大于 0");
+
+        deviceId = RedisKeys.Normalize(deviceId);
+        var seqText = seq.ToString();
+        var runtimeSeq = await _redis.HashGetAsync(
+            RedisKeys.DeviceRuntime(deviceId),
+            "CurrentAgingSeq");
+        if (!runtimeSeq.IsNullOrEmpty &&
+            string.Equals(runtimeSeq.ToString(), seqText, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var sync = _agingTaskQueueLocks.GetOrAdd(deviceId, _ => new SemaphoreSlim(1, 1));
+        await sync.WaitAsync();
+        try
+        {
+            var queue = await ReadAgingTaskQueueUnsafeAsync(
+                RedisKeys.DeviceEventLatest(deviceId, "state"));
+            return queue.Any(value =>
+                string.Equals(value, seqText, StringComparison.Ordinal));
+        }
+        finally
+        {
+            sync.Release();
+        }
     }
 
     public async Task<string?> GetCurrentAgingRecordIdAsync(string deviceId)

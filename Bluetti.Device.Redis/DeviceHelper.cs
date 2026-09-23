@@ -18,10 +18,16 @@ public sealed class DeviceHelper
         => _repository.GetAllAsync();
 
     /// <summary>
-    /// 保持原有格式，返回 lgw:devices:online List 中的 JSON 字符串。
+    /// 返回 lgw:devices:online 全量 List 中的 JSON 字符串。
     /// </summary>
     public Task<string[]> GetOnlineDeviceJsonListAsync()
         => _repository.GetOnlineDeviceJsonListAsync();
+
+    public Task<string[]> GetAgingRackOnlineDeviceJsonListAsync(string agingNumber)
+        => _repository.GetAgingRackOnlineDeviceJsonListAsync(agingNumber);
+
+    public Task<string[]> GetControlOnlineDeviceJsonListAsync()
+        => _repository.GetControlOnlineDeviceJsonListAsync();
 
     public Task<bool> RemoveOnlineDeviceAsync(string deviceId)
         => _repository.RemoveOnlineDeviceAsync(deviceId);

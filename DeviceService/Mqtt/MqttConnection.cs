@@ -100,6 +100,8 @@ namespace DeviceService.Mqtt
         {
             await _client.SubscribeAsync("device/public/up_line");
             await _client.SubscribeAsync("device/public/down_line");
+            await _client.SubscribeAsync("device/public/deviceMode");
+            await _client.SubscribeAsync("device/public/agingStage");
             await _client.SubscribeAsync("device/+/event/+");
             await _client.SubscribeAsync("device/+/data/aging");
             await _client.SubscribeAsync("device/+/log/+");

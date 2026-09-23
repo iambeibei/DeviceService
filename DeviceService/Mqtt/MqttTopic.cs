@@ -5,6 +5,29 @@ namespace DeviceService.Mqtt;
 /// </summary>
 public static class MqttTopic
 {
+    public static bool IsGroupControlMode(string topic)
+        => topic.Equals("device/public/deviceMode", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsGroupControlAgingStage(string topic)
+        => topic.Equals("device/public/agingStage", StringComparison.OrdinalIgnoreCase);
+
+    public static bool TryGetTaskCompletionDeviceId(string topic, out string deviceId)
+    {
+        deviceId = string.Empty;
+        var parts = Split(topic);
+        if (parts.Length != 4 ||
+            !parts[0].Equals("device", StringComparison.OrdinalIgnoreCase) ||
+            parts[1].Equals("public", StringComparison.OrdinalIgnoreCase) ||
+            !parts[2].Equals("event", StringComparison.OrdinalIgnoreCase) ||
+            !parts[3].Equals("TaskCP", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        deviceId = parts[1];
+        return !string.IsNullOrWhiteSpace(deviceId);
+    }
+
     public static bool TryGetDeviceId(string topic, out string deviceId)
     {
         deviceId = string.Empty;

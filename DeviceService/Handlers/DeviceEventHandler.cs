@@ -4,6 +4,8 @@ using DeviceService.Services;
 using MQTTnet;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using StackExchange.Redis;
+using System.Reflection.Metadata;
 using System.Text;
 
 namespace DeviceService.Handlers;
@@ -21,20 +23,24 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
     private readonly CommandRepository _commands;
     private readonly AgingCommandGate _agingGate;
     private readonly AgingRecordCallbackClient _callbackClient;
+    private readonly GroupControlService _groupControl;
     private readonly ILogger<DeviceEventHandler> _logger;
+    private readonly RedisHelper _redisHelper;
 
-    public DeviceEventHandler(
-        DeviceRepository devices,
-        CommandRepository commands,
+    public DeviceEventHandler(DeviceRepository devices,CommandRepository commands,
         AgingCommandGate agingGate,
         AgingRecordCallbackClient callbackClient,
-        ILogger<DeviceEventHandler> logger)
+        GroupControlService groupControl,
+        ILogger<DeviceEventHandler> logger,
+        RedisHelper redisHelper)
     {
         _devices = devices;
         _commands = commands;
         _agingGate = agingGate;
         _callbackClient = callbackClient;
+        _groupControl = groupControl;
         _logger = logger;
+        _redisHelper = redisHelper;
     }
 
     public bool CanHandle(string topic)
@@ -65,6 +71,32 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
         var isStateEvent = eventType.Equals("state", StringComparison.OrdinalIgnoreCase) &&
                            !string.IsNullOrWhiteSpace(agingState);
 
+        if(message.Topic.Contains("warn"))
+        {
+            var jsonWarn = JsonConvert.SerializeObject(new
+            {
+                DeviceID = deviceId,
+                type = eventType,
+                Message = json.SelectToken("Data.Msg")?.Value<string>() ?? "无",
+                ReceivedAtUtc = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+            });
+
+            await _redisHelper.PublishAsync(RedisChannel.Literal(RedisKeys.channelWarn), jsonWarn);
+        }
+        else if(message.Topic.Contains("fault"))
+        {
+            var jsonFault = JsonConvert.SerializeObject(new
+            {
+                DeviceID = deviceId,
+                type = eventType,
+                Message = json.SelectToken("Data.Msg")?.Value<string>() ?? "无",
+                ReceivedAtUtc = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+            });
+
+            await _redisHelper.PublishAsync(RedisChannel.Literal(RedisKeys.channelFault), jsonFault);
+
+        }
+
         try
         {
             await _devices.SaveEventAsync(
@@ -90,6 +122,7 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
             return;
 
         var isExitState = IsExitState(agingState);
+        long? currentAgingSeq = null;
 
         // 状态回调只做快速后台队列入队，不在 MQTT 消息线程等待 HTTPS。
         // 入队失败/关联异常也不能改变下位机真实状态，更不能永久阻塞下一条 start_aging。
@@ -100,7 +133,7 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
             {
                 // SaveEventAsync 不会提前清 CurrentAgingSeq，所以这里可以稳定关联：
                 // DeviceId + CurrentAgingSeq -> cmd Hash -> RecordId。
-                var currentAgingSeq = await _devices.GetCurrentAgingTaskIdAsync(deviceId);
+                currentAgingSeq = await _devices.GetCurrentAgingTaskIdAsync(deviceId);
 
                 // 极窄竞态保护：MQTT QoS1 发布后，ESP32 可能非常快地上报 agingStart，
                 // 此时 Worker 还未来得及把已发布 Seq 从 TaskQueue 移到 CurrentAgingSeq。
@@ -165,6 +198,23 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
                 ex,
                 "老化状态业务 API 回调处理异常，DeviceId={DeviceId}, AgingState={AgingState}",
                 deviceId,
+                agingState);
+        }
+
+        try
+        {
+            await _groupControl.HandleAgingStateAsync(
+                deviceId,
+                currentAgingSeq,
+                agingState!);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "处理群控批次状态失败，DeviceId={DeviceId}, CurrentAgingSeq={CurrentAgingSeq}, AgingState={AgingState}",
+                deviceId,
+                currentAgingSeq?.ToString() ?? "<empty>",
                 agingState);
         }
 

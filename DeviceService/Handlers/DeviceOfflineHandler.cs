@@ -1,5 +1,6 @@
 using Bluetti.Device.Redis;
 using DeviceService.Mqtt;
+using DeviceService.Services;
 using MQTTnet;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -13,13 +14,16 @@ namespace DeviceService.Handlers;
 public sealed class DeviceOfflineHandler : IMqttMessageHandler
 {
     private readonly DeviceRepository _devices;
+    private readonly GroupControlService _groupControl;
     private readonly ILogger<DeviceOfflineHandler> _logger;
 
     public DeviceOfflineHandler(
         DeviceRepository devices,
+        GroupControlService groupControl,
         ILogger<DeviceOfflineHandler> logger)
     {
         _devices = devices;
+        _groupControl = groupControl;
         _logger = logger;
     }
 
@@ -55,16 +59,21 @@ public sealed class DeviceOfflineHandler : IMqttMessageHandler
                 return;
             }
 
+            var previous = await _devices.GetAsync(deviceId);
             var removed = await _devices.SaveOfflineAsync(
                 deviceId,
                 deviceType,
                 seq,
                 payload);
+            await _groupControl.ReevaluateMembershipAsync(
+                previous?.AgingNumber,
+                currentAgingNumber: null);
 
             _logger.LogInformation(
-                "子节点离线，DeviceId={DeviceId}, Type={DeviceType}, RemovedFromOnlineList={Removed}",
+                "节点离线，DeviceId={DeviceId}, Type={DeviceType}, AgingNumber={AgingNumber}, RemovedFromOnlineList={Removed}",
                 deviceId,
                 deviceType,
+                previous?.AgingNumber ?? "<empty>",
                 removed);
         }
         catch (JsonException ex)

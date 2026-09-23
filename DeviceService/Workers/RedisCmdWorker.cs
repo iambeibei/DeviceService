@@ -29,6 +29,7 @@ public sealed class RedisCmdWorker : BackgroundService
     private readonly DeviceRepository _devices;
     private readonly MqttConnection _mqtt;
     private readonly AgingCommandGate _agingGate;
+    private readonly GroupControlService _groupControl;
     private readonly ILogger<RedisCmdWorker> _logger;
     private readonly string _consumerName;
     private readonly TimeSpan _replyTimeout;
@@ -46,6 +47,7 @@ public sealed class RedisCmdWorker : BackgroundService
         DeviceRepository devices,
         MqttConnection mqtt,
         AgingCommandGate agingGate,
+        GroupControlService groupControl,
         IConfiguration configuration,
         ILogger<RedisCmdWorker> logger)
     {
@@ -53,10 +55,10 @@ public sealed class RedisCmdWorker : BackgroundService
         _devices = devices;
         _mqtt = mqtt;
         _agingGate = agingGate;
+        _groupControl = groupControl;
         _logger = logger;
 
-        _consumerName = configuration.GetValue<string>("RedisSettings:ConsumerName")
-            ?? Environment.MachineName;
+        _consumerName = configuration.GetValue<string>("RedisSettings:ConsumerName")?? Environment.MachineName;
 
         var replyTimeoutSeconds = configuration.GetValue<double?>("CommandProcessing:ReplyTimeoutSeconds") ?? 15;
         if (replyTimeoutSeconds <= 0)
@@ -146,6 +148,7 @@ public sealed class RedisCmdWorker : BackgroundService
     /// </summary>
     private async Task RecoverPendingCommandsAsync(CancellationToken ct)
     {
+
         var position = "0-0";
         var recovered = 0;
 
@@ -189,6 +192,13 @@ public sealed class RedisCmdWorker : BackgroundService
                 messageId);
             await _commands.AcknowledgeAsync(messageId);
             return;
+        }
+
+        if (commands.Any(command => IsStartAging(command.Action)))
+        {
+            await _groupControl.RegisterAgingBatchAsync(
+                commands.Where(command => IsStartAging(command.Action)).ToArray(),
+                ct);
         }
 
         var batch = new BatchAckTracker(messageId, commands.Count);
@@ -634,7 +644,8 @@ public sealed class RedisCmdWorker : BackgroundService
             ["Seq"] = command.Seq,
             ["Data"] = command.Data is null
                 ? JValue.CreateNull()
-                : command.Data.DeepClone()
+                : command.Data.DeepClone(),
+            ["RecordId"]= command.RecordId?? ""
         };
 
         var topic = $"server/{command.DeviceId}/cmd/{command.Action}";

@@ -77,6 +77,8 @@ public sealed class RedisHelper
     public Task<bool> HashDeleteAsync(string key, string field)
         => _db.HashDeleteAsync(key, field);
 
+    public Task<bool> KeyDeleteAsync(string key) => _db.KeyDeleteAsync(key);
+
     public Task<bool> KeyExpireAsync(string key, TimeSpan expire) => _db.KeyExpireAsync(key, expire);
 
     public Task<bool> StringSetAsync(string key, string value, TimeSpan? expiry = null)

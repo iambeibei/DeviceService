@@ -9,6 +9,7 @@ public sealed class DeviceNode
     public string DeviceId { get; set; } = string.Empty;
     public bool Online { get; set; }
     public string? DeviceType { get; set; }
+    public string? AgingNumber { get; set; }
     public DateTime? FirstSeenUtc { get; set; }
     public DateTime? LastSeenUtc { get; set; }
     public string? LastSource { get; set; }
