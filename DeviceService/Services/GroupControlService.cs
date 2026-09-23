@@ -956,9 +956,25 @@ public sealed class GroupControlService : BackgroundService
         PendingGroupControlCommand pending,
         CancellationToken cancellationToken)
     {
+        string topic;
         try
         {
-            const string topic = "server/public/Cannextstep";
+            topic = BuildNextStepTopic(agingNumber);
+        }
+        catch (ArgumentException ex)
+        {
+            // 架号非法时绝不退化成公共主题广播，否则会把放行指令送到其它老化架。
+            // 保留 pending，由后台轮询以原 Seq 重试。
+            _logger.LogError(
+                ex,
+                "老化架放行主题的 AgingNumber 无效，保留原 Seq 等待重试，AgingNumber={AgingNumber}, Seq={Seq}",
+                agingNumber,
+                pending.Seq);
+            return;
+        }
+
+        try
+        {
             await _mqtt.PublishAsync(topic, pending.Payload, cancellationToken);
 
             if (state.CurrentRunSeq.HasValue)
@@ -972,7 +988,7 @@ public sealed class GroupControlService : BackgroundService
             await _repository.SaveStateAsync(agingNumber, state);
 
             _logger.LogInformation(
-                "群控批次阶段已通过公共主题放行，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Topic={Topic}, Seq={Seq}, NextGeneration={Generation}",
+                "群控批次阶段已按老化架主题放行，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Topic={Topic}, Seq={Seq}, NextGeneration={Generation}",
                 agingNumber,
                 state.CurrentRunSeq?.ToString() ?? "<empty>",
                 topic,
@@ -992,6 +1008,14 @@ public sealed class GroupControlService : BackgroundService
                 pending.Seq);
         }
     }
+
+    /// <summary>
+    /// 阶段放行主题按老化架隔离：server/rack/{AgingNumber}/CanNextstep。
+    /// AgingNumber 必须先规范化再拼进主题，避免出现空段或非法字符破坏订阅匹配。
+    /// 大小写与设备端订阅串强绑定，改动必须同步固件。
+    /// </summary>
+    private static string BuildNextStepTopic(string agingNumber)
+        => $"server/rack/{RedisKeys.NormalizeAgingNumber(agingNumber)}/CanNextstep";
 
     private async Task TryPublishPowerUnsafeAsync(
         string agingNumber,

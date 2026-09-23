@@ -49,7 +49,7 @@ Action 与回复主题映射定义在 `CommandReplyTypeResolver`：
 
 MQTT → Channel → `MqttMessageWorker` → Handler 写 Redis（最新值 Hash + 历史 Stream）。`device/{id}/event/state` 中的老化状态（agingStart/agingIdle/agingStop/agingError）还会经 `CurrentAgingSeq → cmd:{seq} → RecordId` 触发业务 API 回调。
 
-群控按字符串类型的 AgingNumber 独立运行：Mode=2 下，批量 `start_aging` 的 Seq 作为内部 RunSeq、DeviceInfos 作为候选参与集合，首次真实 `agingStart` 才激活。TaskCP 屏障只检查当前批固定参与集合，在线列表不决定屏障成员；参与设备全部完成后通过公共主题 `server/public/Cannextstep` 放行。type=2 总控进入 `lgw:devices:online:control`，agingStage 对应的 CPower 定向发送给该架唯一在线总控。
+群控按字符串类型的 AgingNumber 独立运行：Mode=2 下，批量 `start_aging` 的 Seq 作为内部 RunSeq、DeviceInfos 作为候选参与集合，首次真实 `agingStart` 才激活。TaskCP 屏障只检查当前批固定参与集合，在线列表不决定屏障成员；参与设备全部完成后按架隔离发布 `server/rack/{AgingNumber}/CanNextstep` 放行（设备端订阅本架主题）。type=2 总控进入 `lgw:devices:online:control`，agingStage 对应的 CPower 定向发送给该架唯一在线总控。
 
 主题解析集中在 `Mqtt/MqttTopic.cs`，严格匹配最新协议（event 只认 state/fault/warn，log 只认 runtime/error/local，cmd/reply 只认 point/state/pn/config），不兼容旧主题。
 
@@ -62,7 +62,7 @@ MQTT → Channel → `MqttMessageWorker` → Handler 写 Redis（最新值 Hash 
 - 手工向 Stream 写命令必须用字段名 `data`（否则 `ReadAsync` 解析不出）；正常入口用 `CmdHelper.SendCmdAsync()`。
 - `AgingNumber` 必须是非负整数格式的字符串（如 `"0"`）；数字 JSON 值 `0` 属于无效协议数据。
 - `{Prefix}:devices:online` 必须是全量 List（元素为 `{"id":"...","type":"...","AgingNumber":"0"|null}` JSON）；type=1 同步进入分架 List，type=2 同步进入总控 List。历史上曾被错误写成 Set；生产库禁止 `FLUSHDB`。
-- 群控状态保存在 `lgw:group-control:{AgingNumber}:*`。候选批次不会改变当前屏障，只有真实 `agingStart` 才激活；当前批结束前另一 RunSeq 的 `agingStart` 会被拒绝并告警。`Cannextstep` 不依赖总控在线状态；无总控或同架存在多个在线总控时仅禁止 `CPower` 下发并保留电源 pending，恢复唯一总控后使用原 Seq 重试。
+- 群控状态保存在 `lgw:group-control:{AgingNumber}:*`。候选批次不会改变当前屏障，只有真实 `agingStart` 才激活；当前批结束前另一 RunSeq 的 `agingStart` 会被拒绝并告警。`CanNextstep` 发布到 `server/rack/{AgingNumber}/CanNextstep`，架号非法时保留 pending 重试且不退化成公共广播，不依赖总控在线状态；无总控或同架存在多个在线总控时仅禁止 `CPower` 下发并保留电源 pending，恢复唯一总控后使用原 Seq 重试。
 - `DeviceId`、PN 等键片段经 `RedisKeys.Normalize*` 校验：不能含冒号、斜杠、空白；ReplyType 只允许 point/state/pn/config。
 - `appsettings.json` 全部指向局域网环境（MQTT broker、Redis、回调 API 均为内网 IP）；`AgingCallback:AllowInvalidServerCertificate=true` 是为自签名证书故意保留的，不要移除。
 
