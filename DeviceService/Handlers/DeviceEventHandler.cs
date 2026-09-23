@@ -11,7 +11,7 @@ using System.Text;
 namespace DeviceService.Handlers;
 
 /// <summary>
-/// 处理 device/{id}/event/state、fault、warn。
+/// 处理 device/{id}/event/state、fault、warn、StepId。
 /// state 事件同时负责：
 /// 1. 保存下位机主动上报的老化状态；
 /// 2. 通过 CurrentAgingSeq 找到 start_aging 对应 RecordId 并回调业务 API；
@@ -71,7 +71,7 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
         var isStateEvent = eventType.Equals("state", StringComparison.OrdinalIgnoreCase) &&
                            !string.IsNullOrWhiteSpace(agingState);
 
-        if(message.Topic.Contains("warn"))
+        if(eventType.Equals("warn", StringComparison.OrdinalIgnoreCase))
         {
             var jsonWarn = JsonConvert.SerializeObject(new
             {
@@ -83,7 +83,7 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
 
             await _redisHelper.PublishAsync(RedisChannel.Literal(RedisKeys.channelWarn), jsonWarn);
         }
-        else if(message.Topic.Contains("fault"))
+        else if(message.Topic.Contains("fault")) 
         {
             var jsonFault = JsonConvert.SerializeObject(new
             {
@@ -95,6 +95,11 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
 
             await _redisHelper.PublishAsync(RedisChannel.Literal(RedisKeys.channelFault), jsonFault);
 
+        }
+        else if(eventType.Equals("stepid", StringComparison.OrdinalIgnoreCase))
+        {
+            var StepId = json.SelectToken("Data.StepId")?.Value<string>();
+            await _devices.StepIDSaveToRuntime(deviceId, StepId);
         }
 
         try

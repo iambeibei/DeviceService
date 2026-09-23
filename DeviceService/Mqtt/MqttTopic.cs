@@ -88,7 +88,7 @@ public static class MqttTopic
         }
 
         var type = parts[3].ToLowerInvariant();
-        if (type is not ("state" or "fault" or "warn"))
+        if (type is not ("state" or "fault" or "warn" or "stepid"))
             return false;
 
         deviceId = parts[1];

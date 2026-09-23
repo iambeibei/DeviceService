@@ -94,6 +94,11 @@ public sealed class DeviceRepository
         await _redis.HashSetAsync(RedisKeys.DeviceRuntime(deviceId),[new HashEntry("FirewareVersion", version)]);
     }
 
+    public async Task StepIDSaveToRuntime(string deviceId, string StepId)
+    {
+        await _redis.HashSetAsync(RedisKeys.DeviceRuntime(deviceId), [new HashEntry("StepId", StepId)]);
+    }
+
 
     /// <summary>
     /// 根据设备 ID 从全量及其所属分类在线列表中删除设备。
@@ -804,7 +809,7 @@ public sealed class DeviceRepository
         var value = NormalizeRequired(eventType, nameof(eventType)).ToLowerInvariant();
         return value switch
         {
-            "state" or "fault" or "warn" => value,
+            "state" or "fault" or "warn" or "stepid" => value,
             _ => throw new ArgumentException(
                 "EventType 只允许 state、fault、warn",
                 nameof(eventType))
