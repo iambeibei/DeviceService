@@ -3,6 +3,7 @@ using Bluetti.Device.Redis.Models;
 using DeviceService.Mqtt;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using StackExchange.Redis;
 using System.Collections.Concurrent;
 
 namespace DeviceService.Services;
@@ -12,9 +13,17 @@ namespace DeviceService.Services;
 /// </summary>
 public sealed class GroupControlService : BackgroundService
 {
+    /// <summary>
+    /// 群控放行指令在命令状态记录中的 Action 名。
+    /// 群控放行不进入命令 Stream，这里只用于让设备回复能匹配到命令记录。
+    /// </summary>
+    private const string ReleaseAction = "can_next";
+
     private readonly GroupControlRepository _repository;
     private readonly DeviceRepository _devices;
+    private readonly CommandRepository _commands;
     private readonly MqttConnection _mqtt;
+    private readonly RedisHelper _redis;
     private readonly ILogger<GroupControlService> _logger;
     private readonly TimeSpan _retryDelay;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _rackLocks =
@@ -24,16 +33,47 @@ public sealed class GroupControlService : BackgroundService
     private readonly ConcurrentDictionary<string, byte> _runRecoveryChecked =
         new(StringComparer.Ordinal);
 
+    // 阶段放行倒计时（第 2 项）。
+    private readonly bool _stageTimeoutEnabled;
+    private readonly TimeSpan _stageTimeout;
+    private readonly bool _halfThresholdCeil;
+    private readonly bool _raiseFaultOnStageTimeout;
+
+    // 放行指令响应校验（第 3 项）。
+    private readonly bool _releaseReplyVerificationEnabled;
+    private readonly int _releaseReplyRetryCount;
+    private readonly TimeSpan _releaseReplyTimeout;
+    private readonly bool _raiseFaultOnReleaseReplyFailure;
+
+    // 异常设备免等待（终态 / 掉线）后立即移出参与集合。
+    private readonly bool _excludeOnAgingTerminal;
+    private readonly bool _excludeOnDeviceOffline;
+    private readonly bool _raiseFaultOnExclusion;
+
+    // 阶段倒计时是否仍要求"完成数达到半数"才起表。
+    private readonly bool _stageTimeoutRequireHalf;
+
+    // 放行回复校验的后台任务去重键集合，避免同一放行指令被重复校验。
+    private readonly ConcurrentDictionary<string, byte> _releaseVerifications =
+        new(StringComparer.Ordinal);
+
+    // 后台校验任务使用的停止信号；ExecuteAsync 启动后赋值。
+    private CancellationToken _serviceToken = CancellationToken.None;
+
     public GroupControlService(
         GroupControlRepository repository,
         DeviceRepository devices,
+        CommandRepository commands,
         MqttConnection mqtt,
+        RedisHelper redis,
         IConfiguration configuration,
         ILogger<GroupControlService> logger)
     {
         _repository = repository;
         _devices = devices;
+        _commands = commands;
         _mqtt = mqtt;
+        _redis = redis;
         _logger = logger;
 
         var retryMilliseconds = configuration.GetValue<int?>(
@@ -43,6 +83,52 @@ public sealed class GroupControlService : BackgroundService
                 "CommandProcessing:PublishRetryDelayMilliseconds 必须大于 0");
 
         _retryDelay = TimeSpan.FromMilliseconds(retryMilliseconds);
+
+        _stageTimeoutEnabled = configuration.GetValue<bool?>(
+            "GroupControl:StageTimeoutEnabled") ?? true;
+
+        var stageTimeoutMinutes = configuration.GetValue<double?>(
+            "GroupControl:StageTimeoutMinutes") ?? 10;
+        if (stageTimeoutMinutes <= 0)
+            throw new InvalidOperationException("GroupControl:StageTimeoutMinutes 必须大于 0");
+        _stageTimeout = TimeSpan.FromMinutes(stageTimeoutMinutes);
+
+        var thresholdMode = configuration.GetValue<string>(
+            "GroupControl:HalfReleaseThresholdMode") ?? "Ceil";
+        _halfThresholdCeil = !thresholdMode.Equals("Floor", StringComparison.OrdinalIgnoreCase);
+
+        _raiseFaultOnStageTimeout = configuration.GetValue<bool?>(
+            "GroupControl:RaiseFaultOnStageTimeout") ?? true;
+
+        _releaseReplyVerificationEnabled = configuration.GetValue<bool?>(
+            "GroupControl:ReleaseReplyVerificationEnabled") ?? true;
+
+        var retryCount = configuration.GetValue<int?>(
+            "GroupControl:ReleaseReplyRetryCount") ?? 1;
+        _releaseReplyRetryCount = retryCount < 0 ? 0 : retryCount;
+
+        var replyTimeoutSeconds = configuration.GetValue<double?>(
+            "CommandProcessing:GroupControlReleaseReplyTimeoutSeconds") ?? 15;
+        if (replyTimeoutSeconds <= 0)
+            throw new InvalidOperationException(
+                "CommandProcessing:GroupControlReleaseReplyTimeoutSeconds 必须大于 0");
+        _releaseReplyTimeout = TimeSpan.FromSeconds(replyTimeoutSeconds);
+
+        _raiseFaultOnReleaseReplyFailure = configuration.GetValue<bool?>(
+            "GroupControl:RaiseFaultOnReleaseReplyFailure") ?? true;
+
+        _excludeOnAgingTerminal = configuration.GetValue<bool?>(
+            "GroupControl:ExcludeOnAgingTerminal") ?? true;
+
+        _excludeOnDeviceOffline = configuration.GetValue<bool?>(
+            "GroupControl:ExcludeOnDeviceOffline") ?? true;
+
+        _raiseFaultOnExclusion = configuration.GetValue<bool?>(
+            "GroupControl:RaiseFaultOnExclusion") ?? true;
+
+        // 默认 false：只要有任意一台完成就起表。设为 true 则恢复"必须过半数"的旧行为。
+        _stageTimeoutRequireHalf = configuration.GetValue<bool?>(
+            "GroupControl:StageTimeoutRequireHalf") ?? false;
     }
 
     /// <summary>
@@ -228,21 +314,40 @@ public sealed class GroupControlService : BackgroundService
                 runSeq.Value);
 
             if (!participants.All(terminal.Contains))
+            {
+                // 该设备已退出老化，不会再上报本阶段完成。
+                // 立即移出阶段放行屏障，否则整架都会被它一个人永久阻塞。
+                // 它仍留在 terminal 集合中，批次结束判定不受影响。
+                if (_excludeOnAgingTerminal)
+                {
+                    await ExcludeParticipantUnsafeAsync(
+                        agingNumber,
+                        runSeq.Value,
+                        deviceId,
+                        "aging_terminal",
+                        $"设备上报 {agingState} 退出老化，已移出当前批次阶段放行屏障，AgingNumber={agingNumber}, RunSeq={runSeq.Value}, Stage={state.CurrentStage}");
+
+                    var remaining = await _repository.GetRunParticipantsAsync(
+                        agingNumber,
+                        runSeq.Value);
+                    if (remaining.Count == 0)
+                    {
+                        await FinishRunUnsafeAsync(
+                            agingNumber,
+                            state,
+                            runSeq.Value,
+                            "参与设备已全部进入终态并移出");
+                    }
+                }
+
                 return;
+            }
 
-            runState.Status = GroupControlRunStatuses.Finished;
-            runState.FinishedAtUtc = DateTime.UtcNow;
-            state.CurrentRunSeq = null;
-            state.PendingNextStep = string.Empty;
-            await _repository.ClearRunCompletedDevicesAsync(agingNumber, runSeq.Value);
-            await _repository.SaveRunStateAsync(agingNumber, runState);
-            await _repository.SaveStateAsync(agingNumber, state);
-
-            _logger.LogInformation(
-                "群控批次全部参与设备已进入终态，批次结束，AgingNumber={AgingNumber}, RunSeq={RunSeq}, ParticipantCount={ParticipantCount}",
+            await FinishRunUnsafeAsync(
                 agingNumber,
+                state,
                 runSeq.Value,
-                participants.Count);
+                "全部参与设备已进入终态");
         }
         finally
         {
@@ -453,6 +558,78 @@ public sealed class GroupControlService : BackgroundService
     }
 
     /// <summary>
+    /// 设备掉线（MQTT 遗嘱）后把它移出当前批次的阶段放行屏障。
+    /// 掉线设备不会再上报 TaskCP，若不剔除会永久阻塞整架放行。
+    /// 剔除后本批次不再等待它；重新上线也不会回归本批次，需等下一个 RunSeq。
+    /// </summary>
+    public async Task HandleDeviceOfflineAsync(string deviceId)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+
+        if (!_excludeOnDeviceOffline)
+            return;
+
+        var device = await _devices.GetAsync(deviceId);
+        if (device is null ||
+            !string.Equals(device.DeviceType, "1", StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(device.AgingNumber))
+        {
+            return;
+        }
+
+        string agingNumber;
+        try
+        {
+            agingNumber = RedisKeys.NormalizeAgingNumber(device.AgingNumber);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "设备架号非法，跳过掉线剔除，DeviceId={DeviceId}, AgingNumber={AgingNumber}",
+                deviceId,
+                device.AgingNumber);
+            return;
+        }
+
+        var rackLock = GetRackLock(agingNumber);
+        await rackLock.WaitAsync();
+        try
+        {
+            var state = await GetStateUnsafeAsync(agingNumber);
+            if (state.Mode != 2 || !state.CurrentRunSeq.HasValue)
+                return;
+
+            var runSeq = state.CurrentRunSeq.Value;
+            var participants = await _repository.GetRunParticipantsAsync(agingNumber, runSeq);
+            if (!participants.Contains(deviceId))
+                return;
+
+            await ExcludeParticipantUnsafeAsync(
+                agingNumber,
+                runSeq,
+                deviceId,
+                "device_offline",
+                $"设备离线，已移出当前批次阶段放行屏障，AgingNumber={agingNumber}, RunSeq={runSeq}, Stage={state.CurrentStage}");
+
+            // 兜底：参与集合被清空后既不会放行也不会结束，直接收尾。
+            var remaining = await _repository.GetRunParticipantsAsync(agingNumber, runSeq);
+            if (remaining.Count == 0)
+            {
+                await FinishRunUnsafeAsync(
+                    agingNumber,
+                    state,
+                    runSeq,
+                    "参与设备已全部掉线移出");
+            }
+        }
+        finally
+        {
+            rackLock.Release();
+        }
+    }
+
+    /// <summary>
     /// 点位或总控的架号/在线状态改变后，只重新评估受影响的老化架。
     /// </summary>
     public async Task ReevaluateMembershipAsync(
@@ -488,8 +665,14 @@ public sealed class GroupControlService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
-            "多老化架群控协调服务已启动，RetryDelayMs={RetryDelayMs}",
-            _retryDelay.TotalMilliseconds);
+            "多老化架群控协调服务已启动，RetryDelayMs={RetryDelayMs}, StageTimeoutEnabled={StageTimeoutEnabled}, StageTimeoutMinutes={StageTimeoutMinutes}, ReleaseReplyVerification={ReleaseReplyVerification}",
+            _retryDelay.TotalMilliseconds,
+            _stageTimeoutEnabled,
+            _stageTimeout.TotalMinutes,
+            _releaseReplyVerificationEnabled);
+
+        // 放行回复校验的后台任务复用本服务的停止信号。
+        _serviceToken = stoppingToken;
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -900,10 +1083,29 @@ public sealed class GroupControlService : BackgroundService
             return;
 
         var runSeq = state.CurrentRunSeq.Value;
+
+        // 阶段倒计时到期先处理，随后才判断是否放行。
+        // 顺序固定为：先超时剔除 → 再判放行 → 最后按需起表。
+        if (_stageTimeoutEnabled &&
+            state.StageDeadlineUtc.HasValue &&
+            DateTime.UtcNow >= state.StageDeadlineUtc.Value)
+        {
+            await ExpireStageTimeoutUnsafeAsync(agingNumber, state, runSeq);
+        }
+
         var participants = await _repository.GetRunParticipantsAsync(agingNumber, runSeq);
+
+        // 参与集合被清空后：既不会放行（count == 0 恒不满足 All），也不会结束（没有设备再上报终态）。
+        // 直接收尾，避免批次永久挂起。
+        if (participants.Count == 0)
+        {
+            await FinishRunUnsafeAsync(agingNumber, state, runSeq, "阶段放行屏障已无参与设备");
+            return;
+        }
+
         var completed = await _repository.GetRunCompletedDeviceIdsAsync(agingNumber, runSeq);
         var online = await _repository.GetOnlinePointDeviceIdsAsync(agingNumber);
-        var canRelease = participants.Count > 0 && participants.All(completed.Contains);
+        var canRelease = participants.All(completed.Contains);
 
         if (!canRelease)
         {
@@ -911,6 +1113,28 @@ public sealed class GroupControlService : BackgroundService
             {
                 state.PendingNextStep = string.Empty;
                 await _repository.SaveStateAsync(agingNumber, state);
+            }
+
+            // 尚未开始计时时启动倒计时。默认只要本阶段已有任意设备完成就起表；
+            // StageTimeoutRequireHalf=true 时恢复"必须达到半数"的旧行为。
+            // 已全覆盖的情况走不到这里，所以不会出现"刚起表就立即放行"。
+            if (_stageTimeoutEnabled &&
+                !state.StageDeadlineUtc.HasValue &&
+                completed.Count > 0 &&
+                (!_stageTimeoutRequireHalf ||
+                 completed.Count >= ComputeHalfThreshold(participants.Count)))
+            {
+                state.StageDeadlineUtc = DateTime.UtcNow + _stageTimeout;
+                await _repository.SaveStateAsync(agingNumber, state);
+
+                _logger.LogInformation(
+                    "群控阶段完成数已达半数，启动阶段放行倒计时，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Completed={CompletedCount}, Participants={ParticipantCount}, Threshold={Threshold}, TimeoutMinutes={TimeoutMinutes}",
+                    agingNumber,
+                    runSeq,
+                    completed.Count,
+                    participants.Count,
+                    ComputeHalfThreshold(participants.Count),
+                    _stageTimeout.TotalMinutes);
             }
 
             _logger.LogDebug(
@@ -921,6 +1145,13 @@ public sealed class GroupControlService : BackgroundService
                 participants.Count(completed.Contains),
                 participants.Count(id => !online.Contains(id)));
             return;
+        }
+
+        // 全员完成：清掉倒计时后走正常放行。
+        if (state.StageDeadlineUtc.HasValue)
+        {
+            state.StageDeadlineUtc = null;
+            await _repository.SaveStateAsync(agingNumber, state);
         }
 
         var pending = ReadPending(state, state.PendingNextStep, isPower: false);
@@ -973,27 +1204,62 @@ public sealed class GroupControlService : BackgroundService
             return;
         }
 
+        var runSeq = state.CurrentRunSeq;
+        var participants = runSeq.HasValue
+            ? await _repository.GetRunParticipantsAsync(agingNumber, runSeq.Value)
+            : (IReadOnlySet<string>)new HashSet<string>(StringComparer.Ordinal);
+
+        // 离线设备收不到架广播，也不该被记成"未收到确认"，校验前先剔除。
+        var verifiable = participants.Count > 0
+            ? await FilterOnlineParticipantsAsync(agingNumber, participants)
+            : (IReadOnlySet<string>)new HashSet<string>(StringComparer.Ordinal);
+
+        if (participants.Count > 0 && verifiable.Count < participants.Count)
+        {
+            _logger.LogWarning(
+                "群控放行回复校验跳过离线设备，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Seq={Seq}, Participants={ParticipantCount}, Verifiable={VerifiableCount}",
+                agingNumber,
+                runSeq?.ToString() ?? "<empty>",
+                pending.Seq,
+                participants.Count,
+                verifiable.Count);
+        }
+
+        // 发布前先登记命令状态，设备按 CmdSeq 回复时才能匹配到这条放行指令。
+        if (_releaseReplyVerificationEnabled && runSeq.HasValue && verifiable.Count > 0)
+            await StoreReleaseCommandsAsync(verifiable, pending.Seq);
+
         try
         {
             await _mqtt.PublishAsync(topic, pending.Payload, cancellationToken);
 
-            if (state.CurrentRunSeq.HasValue)
+            if (runSeq.HasValue)
             {
-                await _repository.ClearRunCompletedDevicesAsync(
-                    agingNumber,
-                    state.CurrentRunSeq.Value);
+                await _repository.ClearRunCompletedDevicesAsync(agingNumber, runSeq.Value);
             }
             state.PendingNextStep = string.Empty;
+            state.StageDeadlineUtc = null;
             state.Generation++;
             await _repository.SaveStateAsync(agingNumber, state);
 
             _logger.LogInformation(
                 "群控批次阶段已按老化架主题放行，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Topic={Topic}, Seq={Seq}, NextGeneration={Generation}",
                 agingNumber,
-                state.CurrentRunSeq?.ToString() ?? "<empty>",
+                runSeq?.ToString() ?? "<empty>",
                 topic,
                 pending.Seq,
                 state.Generation);
+
+            // 放行已生效，回复校验只在后台留痕与重试，不阻塞阶段推进。
+            if (_releaseReplyVerificationEnabled && runSeq.HasValue && verifiable.Count > 0)
+            {
+                StartReleaseVerification(
+                    agingNumber,
+                    runSeq.Value,
+                    pending.Seq,
+                    verifiable,
+                    state.Generation);
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -1008,6 +1274,474 @@ public sealed class GroupControlService : BackgroundService
                 pending.Seq);
         }
     }
+
+    /// <summary>
+    /// 把单台设备移出当前批次的阶段放行屏障。调用方必须持有对应老化架锁。
+    /// 设备不再被等待 TaskCP，也不再阻塞其它设备放行；被移出的设备本批次不再回归，
+    /// 只能等下一个 RunSeq。同时记入 excluded 供审计，并按配置写 event:fault。
+    /// </summary>
+    private async Task ExcludeParticipantUnsafeAsync(
+        string agingNumber,
+        long runSeq,
+        string deviceId,
+        string reason,
+        string message)
+    {
+        await _repository.RemoveRunParticipantsAsync(agingNumber, runSeq, [deviceId]);
+        await _repository.AddRunExcludedDeviceAsync(agingNumber, runSeq, deviceId);
+
+        if (_raiseFaultOnExclusion)
+        {
+            var payload = BuildGroupControlFaultPayload(
+                agingNumber,
+                runSeq,
+                deviceId,
+                reason,
+                message,
+                seq: null);
+            await _devices.SaveGroupControlFaultAsync(deviceId, runSeq, message, payload);
+            await PublishFaultAsync(deviceId, message);
+        }
+
+        _logger.LogWarning(
+            "设备已移出群控批次参与集合，AgingNumber={AgingNumber}, RunSeq={RunSeq}, DeviceId={DeviceId}, Reason={Reason}, FaultRaised={FaultRaised}",
+            agingNumber,
+            runSeq,
+            deviceId,
+            reason,
+            _raiseFaultOnExclusion);
+    }
+
+    /// <summary>
+    /// 结束当前批次并清理阶段状态。调用方必须持有对应老化架锁。
+    /// </summary>
+    private async Task FinishRunUnsafeAsync(
+        string agingNumber,
+        GroupControlState state,
+        long runSeq,
+        string reason)
+    {
+        var runState = await _repository.GetRunStateAsync(agingNumber, runSeq);
+        if (runState is not null)
+        {
+            runState.Status = GroupControlRunStatuses.Finished;
+            runState.FinishedAtUtc = DateTime.UtcNow;
+            await _repository.SaveRunStateAsync(agingNumber, runState);
+        }
+
+        state.CurrentRunSeq = null;
+        state.PendingNextStep = string.Empty;
+        state.StageDeadlineUtc = null;
+        await _repository.ClearRunCompletedDevicesAsync(agingNumber, runSeq);
+        await _repository.SaveStateAsync(agingNumber, state);
+
+        _logger.LogInformation(
+            "群控批次结束，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Reason={Reason}",
+            agingNumber,
+            runSeq,
+            reason);
+    }
+
+    /// <summary>
+    /// 阶段放行的半数阈值。
+    /// Ceil：5 台取 3、6 台取 3；Floor：5 台取 2、6 台取 3。默认 Ceil。
+    /// 参与集合为 1 台时 Ceil 阈值为 1，即"完成即起表"，但这种情况在起表前
+    /// 已完成数必然等于参与数，会直接走全员放行，不会真正启动倒计时。
+    /// </summary>
+    private int ComputeHalfThreshold(int count)
+    {
+        if (count <= 0)
+            return 0;
+
+        return _halfThresholdCeil
+            ? (int)Math.Ceiling(count / 2.0)
+            : (int)Math.Floor(count / 2.0);
+    }
+
+    /// <summary>
+    /// 阶段倒计时到期处理。调用方必须持有对应老化架锁。
+    /// 未完成设备：从 participants 剔除 → 记入 excluded → 记故障（可选）。
+    /// 剔除后本批次不再接受这些设备的 TaskCP（RecordTaskCompletionAsync 以 participants 为屏障），
+    /// 它们只能等下一次 start_aging 批次重新参与，不在本批次复活。
+    /// </summary>
+    private async Task ExpireStageTimeoutUnsafeAsync(
+        string agingNumber,
+        GroupControlState state,
+        long runSeq)
+    {
+        var participants = await _repository.GetRunParticipantsAsync(agingNumber, runSeq);
+        var completed = await _repository.GetRunCompletedDeviceIdsAsync(agingNumber, runSeq);
+        var expired = participants
+            .Where(deviceId => !completed.Contains(deviceId))
+            .OrderBy(deviceId => deviceId, StringComparer.Ordinal)
+            .ToArray();
+
+        // 无论是否真的剔除了设备，倒计时到期后都必须清掉 deadline，
+        // 否则后续每一轮轮询都会重复进入本方法。
+        state.StageDeadlineUtc = null;
+        state.LastStageTimeoutSeq = runSeq;
+
+        if (expired.Length == 0)
+        {
+            await _repository.SaveStateAsync(agingNumber, state);
+
+            _logger.LogInformation(
+                "群控阶段倒计时到期但参与设备已全部完成，倒计时已清空，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Stage={Stage}",
+                agingNumber,
+                runSeq,
+                state.CurrentStage);
+            return;
+        }
+
+        await _repository.RemoveRunParticipantsAsync(agingNumber, runSeq, expired);
+        foreach (var deviceId in expired)
+            await _repository.AddRunExcludedDeviceAsync(agingNumber, runSeq, deviceId);
+
+        if (_raiseFaultOnStageTimeout)
+        {
+            foreach (var deviceId in expired)
+            {
+                var message =
+                    $"群控阶段超时未完成，已剔除出当前批次，AgingNumber={agingNumber}, RunSeq={runSeq}, Stage={state.CurrentStage}";
+                var payload = BuildGroupControlFaultPayload(
+                    agingNumber,
+                    runSeq,
+                    deviceId,
+                    "stage_timeout",
+                    message,
+                    seq: null);
+                await _devices.SaveGroupControlFaultAsync(deviceId, runSeq, message, payload);
+                await PublishFaultAsync(deviceId, message);
+            }
+        }
+
+        await _repository.SaveStateAsync(agingNumber, state);
+
+        _logger.LogWarning(
+            "群控阶段倒计时到期，未完成设备已剔除出参与集合，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Stage={Stage}, Excluded={Excluded}, Remaining={Remaining}, FaultRaised={FaultRaised}",
+            agingNumber,
+            runSeq,
+            state.CurrentStage,
+            string.Join(',', expired),
+            participants.Count - expired.Length,
+            _raiseFaultOnStageTimeout);
+    }
+
+    /// <summary>
+    /// 放行前为每台参与设备登记命令记录，使设备按 CmdSeq 的回复能匹配到这条放行指令。
+    /// 群控放行不进入命令 Stream，因此这里只补状态 Hash，不 Enqueue。
+    /// EnsureStoredAsync 在记录已存在时不改变其状态，重复发布原 Seq 不会误清结果。
+    /// </summary>
+    private async Task StoreReleaseCommandsAsync(
+        IReadOnlySet<string> participants,
+        long seq)
+    {
+        foreach (var deviceId in participants)
+        {
+            await _commands.EnsureStoredAsync(new CmdInfo
+            {
+                Seq = seq,
+                DeviceId = RedisKeys.Normalize(deviceId),
+                Action = ReleaseAction,
+                ExpectedReplyType = "point",
+                Status = CommandStates.Published,
+                CreatedAtUtc = DateTime.UtcNow,
+                PublishedAtUtc = DateTime.UtcNow,
+                Data = new JObject { ["IsCanNext"] = 1 }
+            });
+        }
+    }
+
+    /// <summary>
+    /// 启动放行回复校验。校验在后台执行，不阻塞阶段推进（放行本身已生效）。
+    /// 用 agingNumber/runSeq/generation/seq 组合去重，避免同一条放行指令被重复校验。
+    /// </summary>
+    private void StartReleaseVerification(
+        string agingNumber,
+        long runSeq,
+        long seq,
+        IReadOnlySet<string> participants,
+        long generation)
+    {
+        var dedupKey = $"{agingNumber}:{runSeq}:{generation}:{seq}";
+        if (!_releaseVerifications.TryAdd(dedupKey, 0))
+        {
+            _logger.LogDebug(
+                "群控放行回复校验已存在，跳过重复启动，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Seq={Seq}",
+                agingNumber,
+                runSeq,
+                seq);
+            return;
+        }
+
+        var deviceIds = participants
+            .Select(RedisKeys.Normalize)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(deviceId => deviceId, StringComparer.Ordinal)
+            .ToArray();
+
+        var token = _serviceToken;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await VerifyReleaseRepliesAsync(agingNumber, runSeq, seq, deviceIds, token);
+            }
+            catch (OperationCanceledException)
+            {
+                // 服务停止，正常退出。
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "群控放行回复校验异常终止，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Seq={Seq}",
+                    agingNumber,
+                    runSeq,
+                    seq);
+            }
+            finally
+            {
+                _releaseVerifications.TryRemove(dedupKey, out _);
+            }
+        });
+    }
+
+    /// <summary>
+    /// 逐台等待放行回复：校验 Code 是否为成功值（1），超时未回复或 Code 非 1 都计为失败。
+    /// 失败后按配置次数重发架广播（复用原 Seq 保证设备端幂等）并重新等待；
+    /// 重发前必须 ResetForRetryAsync 把命令状态改回 published，否则第二次等待会立即返回。
+    /// 仍失败才写故障并发布告警。校验结果不改变批次放行判定（放行已生效）。
+    /// </summary>
+    private async Task VerifyReleaseRepliesAsync(
+        string agingNumber,
+        long runSeq,
+        long seq,
+        IReadOnlyList<string> deviceIds,
+        CancellationToken cancellationToken)
+    {
+        var pending = new List<string>(deviceIds);
+        var clearedByOffline = false;
+
+        for (var attempt = 0; attempt <= _releaseReplyRetryCount && pending.Count > 0; attempt++)
+        {
+            // 每轮开始前剔除离线设备：它们收不到架广播，
+            // 等待它们回复只会产生"未收到确认"的假故障。
+            var onlineNow = await _repository.GetOnlinePointDeviceIdsAsync(agingNumber);
+            var offlined = pending.Where(deviceId => !onlineNow.Contains(deviceId)).ToArray();
+            if (offlined.Length > 0)
+            {
+                pending = pending.Where(onlineNow.Contains).ToList();
+
+                _logger.LogWarning(
+                    "群控放行回复校验跳过已离线设备，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Seq={Seq}, Offline={Offline}, Attempt={Attempt}",
+                    agingNumber,
+                    runSeq,
+                    seq,
+                    string.Join(',', offlined),
+                    attempt);
+
+                if (pending.Count == 0)
+                {
+                    clearedByOffline = true;
+                    break;
+                }
+            }
+
+            if (attempt > 0)
+            {
+                // 重发必须复用原 Seq：设备端按 Seq/CmdSeq 幂等去重，换 Seq 会造成重复放行。
+                try
+                {
+                    await _mqtt.PublishAsync(
+                        BuildNextStepTopic(agingNumber),
+                        CreatePayload(seq, "IsCanNext", 1),
+                        cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "群控放行指令重发失败，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Seq={Seq}, Attempt={Attempt}",
+                        agingNumber,
+                        runSeq,
+                        seq,
+                        attempt);
+                }
+
+                foreach (var deviceId in pending)
+                    await _commands.ResetForRetryAsync(deviceId, seq);
+            }
+
+            // 每台设备各自等待、并发进行；单台异常不影响其它设备。
+            var attempts = await Task.WhenAll(pending.Select(async deviceId =>
+            {
+                try
+                {
+                    return (
+                        DeviceId: deviceId,
+                        Result: await _commands.WaitForCompletionAsync(
+                            deviceId, seq, _releaseReplyTimeout, cancellationToken),
+                        Error: (Exception?)null);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    return (DeviceId: deviceId, Result: (CmdInfo?)null, Error: (Exception?)ex);
+                }
+            }));
+
+            var stillPending = new List<string>();
+            foreach (var (deviceId, result, error) in attempts)
+            {
+                if (error is not null)
+                {
+                    _logger.LogWarning(
+                        error,
+                        "等待群控放行回复异常，AgingNumber={AgingNumber}, RunSeq={RunSeq}, DeviceId={DeviceId}, Seq={Seq}",
+                        agingNumber,
+                        runSeq,
+                        deviceId,
+                        seq);
+                    stillPending.Add(deviceId);
+                    continue;
+                }
+
+                if (result is not null &&
+                    string.Equals(result.Status, CommandStates.Completed, StringComparison.OrdinalIgnoreCase) &&
+                    result.ResultCode == 1)
+                {
+                    continue;
+                }
+
+                // null 表示超时未回复；failed 表示设备回复了但 Code 非 1。
+                // 两者都先补记 timed_out，保证命令状态有终态可追溯。
+                var command = result ?? await _commands.GetAsync(deviceId, seq);
+                if (command is not null && !CommandStates.IsTerminal(command.Status))
+                    await _commands.MarkTimedOutAsync(command, _releaseReplyTimeout);
+
+                _logger.LogWarning(
+                    "群控放行回复校验未通过，AgingNumber={AgingNumber}, RunSeq={RunSeq}, DeviceId={DeviceId}, Seq={Seq}, Status={Status}, Code={Code}, Msg={Msg}, Attempt={Attempt}",
+                    agingNumber,
+                    runSeq,
+                    deviceId,
+                    seq,
+                    result?.Status ?? "<no-reply>",
+                    result?.ResultCode?.ToString() ?? "<empty>",
+                    result?.ResultMessage ?? "<empty>",
+                    attempt);
+
+                stillPending.Add(deviceId);
+            }
+
+            pending = stillPending;
+        }
+
+        if (pending.Count == 0)
+        {
+            if (clearedByOffline)
+            {
+                _logger.LogWarning(
+                    "群控放行回复校验结束：待校验设备已全部离线，不再等待确认，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Seq={Seq}, DeviceCount={DeviceCount}",
+                    agingNumber,
+                    runSeq,
+                    seq,
+                    deviceIds.Count);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "群控放行指令已收到全部设备确认，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Seq={Seq}, DeviceCount={DeviceCount}",
+                    agingNumber,
+                    runSeq,
+                    seq,
+                    deviceIds.Count);
+            }
+
+            return;
+        }
+
+        _logger.LogError(
+            "群控放行指令仍有设备未确认，AgingNumber={AgingNumber}, RunSeq={RunSeq}, Seq={Seq}, Unconfirmed={Unconfirmed}",
+            agingNumber,
+            runSeq,
+            seq,
+            string.Join(',', pending));
+
+        if (!_raiseFaultOnReleaseReplyFailure)
+            return;
+
+        foreach (var deviceId in pending)
+        {
+            var message =
+                $"群控放行指令未收到设备确认，AgingNumber={agingNumber}, RunSeq={runSeq}, Seq={seq}";
+            var payload = BuildGroupControlFaultPayload(
+                agingNumber,
+                runSeq,
+                deviceId,
+                "release_reply_unconfirmed",
+                message,
+                seq);
+            await _devices.SaveGroupControlFaultAsync(deviceId, seq, message, payload);
+            await PublishFaultAsync(deviceId, message);
+        }
+    }
+
+    /// <summary>
+    /// 取参与集合中当前仍在线的点位设备。离线设备收不到架广播，
+    /// 放行回复校验不应等待它们，也不应因其"未回复"而记故障。
+    /// </summary>
+    private async Task<IReadOnlySet<string>> FilterOnlineParticipantsAsync(
+        string agingNumber,
+        IReadOnlySet<string> participants)
+    {
+        var online = await _repository.GetOnlinePointDeviceIdsAsync(agingNumber);
+        return new HashSet<string>(
+            participants.Where(online.Contains),
+            StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// 服务端主动产生的群控故障载荷，写入设备 event/fault 历史用于追溯。
+    /// </summary>
+    private static string BuildGroupControlFaultPayload(
+        string agingNumber,
+        long runSeq,
+        string deviceId,
+        string reason,
+        string message,
+        long? seq)
+        => new JObject
+        {
+            ["AgingNumber"] = agingNumber,
+            ["RunSeq"] = runSeq,
+            ["DeviceId"] = deviceId,
+            ["Seq"] = seq?.ToString() ?? string.Empty,
+            ["Reason"] = reason,
+            ["Message"] = message,
+            ["OccurredAtUtc"] = DateTime.UtcNow.ToString("O")
+        }.ToString(Formatting.None);
+
+    /// <summary>
+    /// 发布故障告警，格式与设备自发故障保持一致（DeviceID / type / Message / ReceivedAtUtc）。
+    /// </summary>
+    private Task PublishFaultAsync(string deviceId, string message)
+        => _redis.PublishAsync(
+            RedisKeys.channelFault,
+            new JObject
+            {
+                ["DeviceID"] = deviceId,
+                ["type"] = "fault",
+                ["Message"] = message,
+                ["ReceivedAtUtc"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+            }.ToString(Formatting.None));
 
     /// <summary>
     /// 阶段放行主题按老化架隔离：server/rack/{AgingNumber}/CanNextstep。
@@ -1128,6 +1862,7 @@ public sealed class GroupControlService : BackgroundService
         state.LastAppliedControllerId = string.Empty;
         state.PendingNextStep = string.Empty;
         state.PendingPower = string.Empty;
+        state.StageDeadlineUtc = null;
     }
 
     private static string CreatePayload(long seq, string fieldName, int value)

@@ -36,8 +36,19 @@ Action 与回复主题映射：`get_state` → `state`，`set_pn` → `pn`，`ge
 - 命名空间陷阱：`namespace DeviceService.Works` 实际位于 `Workers/MqttMessageWorker.cs`（文件夹名与命名空间不一致）。
 - `appsettings.json` 指向局域网环境（MQTT broker、Redis、回调 API 均为内网 IP）；`AgingCallback:AllowInvalidServerCertificate=true` 是为自签名证书故意保留的。
 - 回复等待基于进程内 `TaskCompletionSource` + Redis Hash 双重确认（见 `CommandRepository.WaitForCompletionAsync`），命令最终状态以 Redis Hash 为准，不要只依赖内存通知。
+- **群控阶段超时与半数放行**（`GroupControlService.EvaluateNextStepUnsafeAsync`，顺序固定为"先超时剔除 → 再判放行 → 最后按需起表"）：本阶段 `completed` 数达到 `Ceil(participants.Count / 2)` 起 10 分钟倒计时（deadline 存 `state.StageDeadlineUtc`，复用现有 1s 轮询，**不引入 Timer**）；到期把 `participants \ completed` 从 participants 剔除、记入 `...run:{runSeq}:excluded` 并写 `event:fault`，随后放行剩余设备。被剔除设备**本批次不再回归**（屏障以 participants 为准），只能等下一个 RunSeq。全员完成会清掉倒计时直接放行。详见 `docs/群控阶段超时与TTL改造方案.md`。
+- **放行回复校验**：`CanNextstep` 发布前先为每台 participant `EnsureStoredAsync` 一条 `Action="can_next"` 的命令记录（群控指令不进 Stream），设备按现有协议回 `device/{id}/cmd/reply/point` + `Data.CmdSeq`，`Code==1` 才算确认。后台并发等待 → 失败则 `MarkTimedOut` 后**用原 Seq 整架重发一次**，重发前必须 `CommandRepository.ResetForRetryAsync`（否则 `WaitForCompletionAsync` 遇终态立即返回、重试形同虚设）→ 仍失败写 `event:fault` 并 publish `event:fault`。校验只留痕，**不回滚放行、不联动剔除 participants**。
+- **终态 / 掉线设备必须立即移出 participants**：放行判定只看 `completed`，设备一旦上报 `agingStop/agingError/agingIdle` 或掉线（`device/public/down_line`），就不会再上报 TaskCP，若留在 participants 会永久阻塞整架放行。由 `GroupControlService.HandleAgingStateAsync`（终态分支）与 `HandleDeviceOfflineAsync`（掉线，`DeviceOfflineHandler` 调用）统一走 `ExcludeParticipantUnsafeAsync`：移出 participants → 记 `excluded` → 按 `RaiseFaultOnExclusion` 写 fault。被移出设备**本批次不回归**，只能等下一个 RunSeq。参与集合被清空时走 `FinishRunUnsafeAsync` 直接结束批次，否则既不放行也不结束会挂死。
+- **阶段倒计时起表条件默认不要求过半数**（`StageTimeoutRequireHalf=false`，只要本阶段有任意设备完成就起表）：若要求过半数，当多数设备掉线/终态时会永远起不了表，批次无兜底挂起。
+- **放行回复校验会跳过离线设备**（`FilterOnlineParticipantsAsync`）：架广播送不到离线设备，等待它们只会产生"未收到确认"的假故障。
+- **`AgingCommandGate` 有离线兜底释放**：设备掉线后不会再上报终态，发送门等待超过 `AgingCommandGate:OfflineReleaseTimeoutMinutes`（默认 30）且设备已离线时强制释放门。注意只在**设备已离线**时释放——设备在线时老化可能仍在进行（可能持续数小时），不能按时间强行插队。
+- **服务端自产故障必须走 `DeviceRepository.SaveGroupControlFaultAsync`**，不要用 `SaveEventAsync`：后者内部会 `MarkSeenAsync()` 把 `runtime.Online` 置 true，会把离线设备"复活"成在线，进而污染总控唯一性判断。
 - 群控状态保存在 `lgw:group-control:{AgingNumber}:*`；候选批次不会替换当前批次，首次真实 `agingStart` 才激活。当前批结束前若另一 RunSeq 上报 `agingStart`，拒绝切换并告警。TaskCP 仅接受当前批参与设备，并按 AgingNumber + DeviceId + 单调递增 Seq 去重。`CanNextstep` 发布到 `server/rack/{AgingNumber}/CanNextstep`（架号经 `RedisKeys.NormalizeAgingNumber` 规范化后拼接，架号非法时保留 pending 重试，不退化成公共广播），不依赖总控在线状态；只有 `CPower` 要求该架恰好存在一个在线总控，无总控或多个总控时保留电源 pending。群控直接指令不进入命令 Stream、不等待命令回复，发布失败或重启时使用原 Seq 重试。
 
 ## 配置
 
-`CommandProcessing.ReplyTimeoutSeconds`（默认 15s）与 `PublishRetryDelayMilliseconds`（默认 1000ms）在 `appsettings.json` 中调整；消费组内 Consumer 名取 `RedisSettings:ConsumerName`，缺省为本机名。
+`CommandProcessing.ReplyTimeoutSeconds`（默认 15s）、`PublishRetryDelayMilliseconds`（默认 1000ms，同时是群控后台轮询间隔）、`GroupControlReleaseReplyTimeoutSeconds`（默认 15s，单台放行回复等待）在 `appsettings.json` 中调整；消费组内 Consumer 名取 `RedisSettings:ConsumerName`，缺省为本机名。
+
+`GroupControl` 段（群控阶段超时与放行校验）：`StageTimeoutEnabled`、`StageTimeoutMinutes`（默认 10）、`StageTimeoutRequireHalf`（默认 false = 有任意设备完成即起表）、`HalfReleaseThresholdMode`（`Ceil`/`Floor`，默认 Ceil）、`ExcludedRejoinMode`（当前仅 `None`）、`RaiseFaultOnStageTimeout`、`ExcludeOnAgingTerminal`（默认 true）、`ExcludeOnDeviceOffline`（默认 true）、`RaiseFaultOnExclusion`（默认 true）、`ReleaseReplyVerificationEnabled`、`ReleaseReplyRetryCount`（默认 1）、`RaiseFaultOnReleaseReplyFailure`。
+
+`AgingCommandGate` 段：`OfflineReleaseTimeoutMinutes`（默认 30，≤0 表示禁用离线兜底释放）。

@@ -335,6 +335,49 @@ public sealed class DeviceRepository
     }
 
     /// <summary>
+    /// 记录服务端内部产生的故障（如群控阶段超时剔除、放行指令未收到设备确认）。
+    ///
+    /// 与 SaveEventAsync 的区别：本方法不会调用 MarkSeenAsync。
+    /// MarkSeenAsync 会把 runtime.Online 置为 true 并刷新 LastSeenUtc，
+    /// 给离线设备写故障会把它"复活"成在线，进而影响总控唯一性判断和在线诊断。
+    /// 服务端主动产生的故障不是设备活动证据，因此不能刷新在线状态。
+    /// </summary>
+    public async Task SaveGroupControlFaultAsync(
+        string deviceId,
+        long? messageSeq,
+        string message,
+        string rawPayload)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+        const string eventType = "fault";
+        var now = DateTime.UtcNow;
+        var eventKey = RedisKeys.DeviceEventLatest(deviceId, eventType);
+
+        await _redis.HashSetAsync(
+            eventKey,
+            [
+                new HashEntry("DeviceId", deviceId),
+                new HashEntry("EventType", eventType),
+                new HashEntry("Seq", messageSeq?.ToString() ?? string.Empty),
+                new HashEntry("State", string.Empty),
+                new HashEntry("Message", message ?? string.Empty),
+                new HashEntry("Payload", rawPayload),
+                new HashEntry("ReceivedAtUtc", now.ToString("O"))
+            ]);
+
+        await _redis.StreamAddAsync(
+            RedisKeys.DeviceEventHistory(deviceId, eventType),
+            [
+                new NameValueEntry("seq", messageSeq?.ToString() ?? string.Empty),
+                new NameValueEntry("state", string.Empty),
+                new NameValueEntry("message", message ?? string.Empty),
+                new NameValueEntry("payload", rawPayload),
+                new NameValueEntry("receivedAtUtc", now.ToString("O"))
+            ],
+            maxLength: 50_000);
+    }
+
+    /// <summary>
     /// 兼容读取旧版数字数组 [111,222] 与新版字符串数组 ["111","222"]，
     /// 返回值始终规范化成 List&lt;string&gt;。
     /// </summary>

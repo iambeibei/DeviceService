@@ -61,6 +61,12 @@ public static class RedisKeys
     public static string GroupControlRunTerminalDevices(string agingNumber, long runSeq)
         => $"{GroupControlRunRoot(agingNumber, runSeq)}:terminal";
 
+    /// <summary>
+    /// 因阶段超时被剔除出当前批次的设备。仅用于审计与展示，不参与任何放行判定。
+    /// </summary>
+    public static string GroupControlRunExcludedDevices(string agingNumber, long runSeq)
+        => $"{GroupControlRunRoot(agingNumber, runSeq)}:excluded";
+
     // 原有全局设备事件流，仅用于保持上线/下线处理格式。
     public const string DeviceEventStream = $"{Prefix}:device:events";
 

@@ -1,7 +1,11 @@
-# 群控阶段超时、Redis TTL 统一、放行指令响应校验 — 改造方案（待确认）
+# 群控阶段超时、Redis TTL 统一、放行指令响应校验 — 改造方案
 
-> 状态：**第 1 项（TTL）已按收敛后的范围实施完成**；第 2、3 项仍为计划，待阻塞点确认。
-> 验证手段：项目无测试项目，验证即为 `dotnet build DeviceService.slnx` 通过（0 错误）+ 冒烟场景。
+> 状态：**三项全部实施完成**。`dotnet build DeviceService.slnx` → **0 错误**（4+2 个警告均为改动前既有）。
+> - 第 1 项 TTL：已实施，见 §1.4 / 顶部"已确认并已实施"。
+> - 第 2 项阶段超时：已实施（**Ceil** 取整、10 分钟、剔除后**不回归**），见 **§7.1 / §8**。
+> - 第 3 项放行回复校验：已实施（**线路 A**，设备按现有 `Data.CmdSeq` 协议回复），见 **§7.2 / §8**。
+> - 用户最终裁决：① 半数取整 = **Ceil**；② `GroupControlRepository.RunTtl` **不改**，保持私有常量 7 天；③ 校验失败**不联动剔除 participants**。
+> 验证手段：项目无测试项目，验证即为编译通过（0 错误）+ 手工冒烟（见 §7.4）。
 
 ### 已确认并已实施（第 1 项收敛范围）
 
@@ -371,9 +375,241 @@ VerifyReleaseRepliesAsync（每个设备并行等待，不持 rackLock）:
 
 ## 6. 需你确认的问题（阻塞项已标红）
 
-1. **【阻塞】放行指令的设备回复报文**：是 `{"Seq":..,"Data":{"CmdSeq":..}}`（现有协议）还是示例中的顶层 `CmdSeq`？
-2. **【阻塞】Code 成功值**是否恒为 1；其他值的含义？
-3. 半数取整：确认 Ceil（n=5 → 3 台）还是 Floor（n=5 → 2 台）？
+1. **【已确认 · 线路 A】放行回复采用现有协议**：主题 `device/{deviceId}/cmd/reply/point`，
+   报文 `{"Seq":<消息序号>,"Data":{"CmdSeq":<放行指令Seq>,"Code":1,"Msg":null,"CmdData":null}}`。
+   结论：**不需要改动 `CommandResponseHandler`**，现有 `PointCommandReplyHandler` 直接可接。
+2. **【已确认】`Code = 1` 为成功**（设备收到放行指令后回复）；其它值视为失败。
+3. 半数取整：确认 Ceil（n=5 → 3 台）还是 Floor（n=5 → 2 台）？**当前默认 Ceil**，配置项可改。
 4. 被剔除设备在当前批次内是否确认不再回归（方案 A）？
 5. TTL 统一默认 7 天是否可接受？其中 `runtime`/`event:state`/在线列表/架状态保持永久，是否认可？
-6. 放行回复校验失败是否需要联动"从下一阶段 participants 剔除"？
+6. 放行回复校验失败是否需要联动"从下一阶段 participants 剔除"？（当前计划：不联动，仅留痕）
+
+---
+
+## 7. 最终实施计划（线路 A 已确认，以此为准）
+
+### 7.0 协议约定（线路 A，已确认，无需改现有 Handler）
+
+```
+下行：主题 server/rack/{AgingNumber}/CanNextstep
+      报文 {"Seq":<放行Seq>,"Data":{"IsCanNext":1}}
+上行：主题 device/{deviceId}/cmd/reply/point
+      报文 {"Seq":<消息序号>,"Data":{"CmdSeq":<放行Seq>,"Code":1,"Msg":null,"CmdData":null}}
+```
+
+命中链路：`PointCommandReplyHandler` → `DeviceRepository.SaveCommandReplyAsync`
+→ `CommandRepository.CompleteAsync(deviceId, CmdSeq, "point", Code, Msg, payload)`
+→ 唤醒 `WaitForCompletionAsync` → `code == 1 ? completed : failed`。
+**前提是发布前用 `EnsureStoredAsync` 建好 `lgw:device:{id}:cmd:{seq}`**，否则回复会被当成孤儿命令。
+
+---
+
+### 7.1 第 2 项：阶段超时与半数放行
+
+**触发**：`Mode=2` 且有 `CurrentRunSeq`，本阶段 `completed` 数 ≥ `Ceil(participants.Count / 2)` 且未全覆盖 → 启动 10 分钟倒计时。
+**到期**：剔除未完成设备 → 写故障 → 放行剩余。
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `Bluetti.Device.Redis/Models/GroupControlState.cs` | 新增 `StageDeadlineUtc`（`DateTime?`）、`LastStageTimeoutSeq`（`long?`） |
+| 2 | `Bluetti.Device.Redis/RedisKeys.cs` | 新增 `GroupControlRunExcludedDevices(agingNumber, runSeq)` → `...:run:{runSeq}:excluded` |
+| 3 | `Bluetti.Device.Redis/GroupControlRepository.cs` | 新增 `RemoveRunParticipantsAsync`、`AddRunExcludedDeviceAsync`、`GetRunExcludedDeviceIdsAsync`（复用 `RunTtl`） |
+| 4 | `DeviceService/Services/GroupControlService.cs` | `EvaluateNextStepUnsafeAsync`：**先查超时 → 再判放行 → 最后起表**；新增 `ExpireStageTimeoutUnsafeAsync()`；`TryPublishNextStepUnsafeAsync` / `UpdateModeAsync` / `ResetRackActivity` 清计时 |
+| 5 | `Bluetti.Device.Redis/DeviceRepository.cs` | 新增 `SaveGroupControlFaultAsync()`（落 `event:fault` 但**不调用 `MarkSeenAsync`**） |
+| 6 | 同上 | 构造注入新增 `RedisHelper`（publish `lgw:event:fault`）、`DeviceRepository` 已有 |
+
+**故障记录字段**（Hash `lgw:device:{id}:event:fault` + history Stream，与 `DeviceEventHandler` 同构）：
+`DeviceId` / `EventType=fault` / `Seq=<放行Seq>` / `State=` / `Message="群控阶段等待超时，设备未上报阶段完成，已剔除出当前批次"` /
+`Payload={"Seq":..,"Data":{"AgingNumber":"0","RunSeq":88,"Stage":"Discharge","Reason":"StageTimeout","TimeoutMinutes":10,"CompletedCount":3,"ParticipantCount":5,"Excluded":true}}`
+写入时机：**与剔除同一把锁内、放行之前**；写入失败只记日志，不阻断放行。同步 publish `lgw:event:fault`。
+
+**剔除后是否回归**：不回归（写 `excluded`，当前批次后续阶段不再等待；新 RunSeq 自动重新纳入）。
+**计时器**：复用现有 1s 后台轮询，**不引入 Timer**；`StageDeadlineUtc` 存 Redis，重启继续计时；所有变更在 `rackLock` 内。
+
+---
+
+### 7.2 第 3 项：放行指令响应校验（线路 A）
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `DeviceService/Services/GroupControlService.cs` | 构造注入新增 `CommandRepository`；新增字段 `_serviceStoppingToken`、`_releaseVerifications`（`ConcurrentDictionary`） |
+| 2 | 同上 `TryPublishNextStepUnsafeAsync` | 发布前对**每台 participant** 调 `EnsureStoredAsync`（`Action="can_next"`、`ExpectedReplyType="point"`、`Seq=pending.Seq`、`RecordId=null`）；发布成功后 `_ = VerifyReleaseRepliesAsync(...)`（不阻塞轮询） |
+| 3 | 同上（新增） | `VerifyReleaseRepliesAsync(agingNumber, runSeq, seq, deviceIds, generation, ct)`：逐台 `WaitForCompletionAsync` → 分类 → 重试 → 写故障 |
+| 4 | `Bluetti.Device.Redis/CommandRepository.cs` | 新增 `ResetForRetryAsync(deviceId, seq)`：强制把状态改回 `published` 并清空终态字段（见下方"坑"） |
+| 5 | `Bluetti.Device.Redis/DeviceRepository.cs` | `SaveGroupControlFaultAsync()`（与 §7.1 共用） |
+
+**为什么必须新增 `ResetForRetryAsync`（实现时最容易踩的坑）**：
+`WaitForCompletionAsync` 开头若发现命令已处于终态（`completed/failed/timed_out`）会**立即返回**，不会等待；
+而 `MarkPublishedAsync` / `MarkQueuedAsync` 都有终态保护（已是终态就直接 return，不会重置）。
+→ 第一次等待超时后命令被置为 `timed_out`，若直接再调 `WaitForCompletionAsync` 会瞬间返回、重试形同虚设。
+→ 因此重试前必须调用 `ResetForRetryAsync` 把状态强制改回 `published` 再等待。
+
+**校验流程**
+```
+发布成功 → 清 completed / PendingNextStep / Generation++（现有逻辑不变）
+        → 若 ReleaseReplyVerificationEnabled 且 _releaseVerifications.TryAdd("{n}:{runSeq}:{generation}:{seq}")
+            → 后台：对每台设备 WaitForCompletionAsync(deviceId, seq, ReleaseReplyTimeoutSeconds=15)
+                completed(Code=1) → 正常
+                failed(Code≠1) 或 null(超时) → MarkTimedOut 记录 → 重发架广播一次（原 Seq）
+                                              → ResetForRetryAsync → 再等一次
+                                              → 仍失败/超时 → SaveGroupControlFaultAsync + publish 告警
+```
+- **重试是整架重发**（`CanNextstep` 是架广播），已确认设备会重复收到，**依赖设备按 `CmdSeq` 幂等去重**；
+- **不回滚放行**，校验只留痕；
+- 每台设备各自等待，用 `Task.WhenAll` 并发；
+- 结果分类文案区分"未收到设备确认（超时）"与"设备返回失败 Code=xx"——注意这是**送达确认**，不是执行确认。
+
+---
+
+### 7.3 新增配置项（最终版）
+
+```json
+"CommandProcessing": {
+  "ReplyTimeoutSeconds": 15,
+  "PublishRetryDelayMilliseconds": 1000,
+  "GroupControlReleaseReplyTimeoutSeconds": 15
+},
+"GroupControl": {
+  "StageTimeoutEnabled": true,
+  "StageTimeoutMinutes": 10,
+  "HalfReleaseThresholdMode": "Ceil",
+  "ExcludedRejoinMode": "None",
+  "RaiseFaultOnStageTimeout": true,
+  "ReleaseReplyVerificationEnabled": true,
+  "ReleaseReplyRetryCount": 1,
+  "RaiseFaultOnReleaseReplyFailure": true
+}
+```
+
+### 7.4 实施顺序与验证
+
+1. §7.1 阶段超时（状态字段 → 仓储 → 服务逻辑 → 配置）
+2. §7.2 放行校验（`ResetForRetryAsync` → `EnsureStored` → 后台校验 → 故障记录）
+3. 每步 `dotnet build DeviceService.slnx` 验证 0 错误
+
+冒烟（无测试项目，只能手工）：
+- 单架 2 台，只让 1 台报 `TaskCP` → 观察 10 分钟后是否剔除另一台 + 写 fault + 放行；
+- 放行后 `HGETALL lgw:device:{id}:cmd:{放行Seq}` 应为 `completed` 且 `ResultCode=1`；
+- 把某台断电模拟不回复 → 观察 15s 超时 → 重发一次 → 仍无 → fault 记录。
+
+### 7.5 遗留待定项（**已全部裁决**）
+
+| 待定项 | 裁决 |
+|---|---|
+| 半数取整 Ceil / Floor | **Ceil**（`(int)Math.Ceiling(count / 2.0)`；配置项 `HalfReleaseThresholdMode=Floor` 可切回） |
+| `GroupControlRepository.RunTtl` 是否改引用 `RedisTtl` | **不用更改**，保持私有常量 7 天 |
+| 校验失败是否联动"下一阶段剔除 participants" | **不用**，只留痕 + 告警，不影响放行判定 |
+
+---
+
+## 8. 实施记录（代码已落地）
+
+### 8.1 数据层
+
+| 文件 | 改动 |
+|---|---|
+| `Models/GroupControlState.cs` | + `StageDeadlineUtc`(`DateTime?`)、`LastStageTimeoutSeq`(`long?`) |
+| `RedisKeys.cs` | + `GroupControlRunExcludedDevices(n, runSeq)` → `lgw:group-control:{n}:run:{runSeq}:excluded` |
+| `GroupControlRepository.cs` | + `RemoveRunParticipantsAsync` / `AddRunExcludedDeviceAsync` / `GetRunExcludedDeviceIdsAsync` |
+| `CommandRepository.cs` | + `ResetForRetryAsync(deviceId, cmdSeq)`：强制改回 `published` 并清空终态字段 |
+| `DeviceRepository.cs` | + `SaveGroupControlFaultAsync(deviceId, messageSeq, message, rawPayload)`：**不调用 `MarkSeenAsync`** |
+
+### 8.2 `DeviceService/Services/GroupControlService.cs`
+
+| 位置 | 改动 |
+|---|---|
+| 字段/构造 | + `CommandRepository` / `RedisHelper` 注入；+ 8 个配置字段；+ `_releaseVerifications`、`_serviceToken`；+ `const ReleaseAction = "can_next"` |
+| `ExecuteAsync` | 启动日志补充新开关；`_serviceToken = stoppingToken` 供后台校验任务使用 |
+| `EvaluateNextStepUnsafeAsync` | 三段顺序固定：**先超时剔除 → 再判放行 → 最后按需起表** |
+| `ExpireStageTimeoutUnsafeAsync` | 到期：算 `participants \ completed` → `SREM participants` + `SADD excluded` →（可选）写 fault + publish → 清 `StageDeadlineUtc`、写 `LastStageTimeoutSeq` |
+| `ComputeHalfThreshold` | Ceil / Floor，默认 Ceil |
+| `TryPublishNextStepUnsafeAsync` | 发布前 `StoreReleaseCommandsAsync`（每台 participant `EnsureStoredAsync`）；发布成功后 `StartReleaseVerification` |
+| `StartReleaseVerification` | `TryAdd("{n}:{runSeq}:{generation}:{seq}")` 去重后 `Task.Run` 后台执行，结束移除去重键 |
+| `VerifyReleaseRepliesAsync` | `Task.WhenAll` 并发等待 → `completed && ResultCode==1` 判成功；失败先 `MarkTimedOutAsync` → 整架重发（**原 Seq**）→ `ResetForRetryAsync` → 再等 → 仍失败写 fault + publish |
+| `BuildGroupControlFaultPayload` / `PublishFaultAsync` | 故障载荷与告警格式（与 `DeviceEventHandler` 同构：`DeviceID/type/Message/ReceivedAtUtc`） |
+| 清理点 | `HandleAgingStateAsync`（批次 finished）、`ResetRackActivity`（Mode 切换）、放行成功分支 均清 `StageDeadlineUtc` |
+
+### 8.3 配置（`DeviceService/appsettings.json`）
+
+已按 §7.3 原样落地 `CommandProcessing:GroupControlReleaseReplyTimeoutSeconds` 与 `GroupControl` 段。
+`Program.cs` 无需改动：`RedisHelper` / `CommandRepository` / `DeviceRepository` 均已是 Singleton，构造注入可解析。
+
+### 8.4 与计划的偏差（1 处，已对齐）
+
+
+- 计划 §7.2 写"逐台等待"，实际实现改为 **`Task.WhenAll` 并发等待**（符合 §7.2 末尾"每台设备各自等待，用 `Task.WhenAll` 并发"）。单轮最长耗时 = `ReleaseReplyTimeoutSeconds`，与设备数无关。
+- 故障 `Payload` 采用扁平 JSON（`AgingNumber/RunSeq/DeviceId/Seq/Reason/Message/OccurredAtUtc`），未嵌套进 `Data`，因为这是服务端自产故障而非设备上报报文。
+- 剔除后设备**不会**被加回 participants；`excluded` 仅审计。
+
+---
+
+## 9. 异常设备兜底（终态 / 掉线 / 发送门）
+
+§7 实施完成后复核发现：放行判定只看 `completed`，`terminal` 与在线状态都不参与，
+因此**设备自报终态、报 fault、掉线三种情况都会永久阻塞整架放行**，且在"不足半数"时
+连 10 分钟超时都起不了表，批次无兜底挂起。本节为已实施的补强。
+
+### 9.1 终态 / 掉线立即移出 participants
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `Services/GroupControlService.cs` | 新增 `ExcludeParticipantUnsafeAsync(n, runSeq, deviceId, reason, message)`：`SREM participants` → `SADD excluded` → 按 `RaiseFaultOnExclusion` 写 fault + publish |
+| 2 | 同上 | 新增 `FinishRunUnsafeAsync(n, state, runSeq, reason)`：批次置 finished、清 `CurrentRunSeq` / `PendingNextStep` / `StageDeadlineUtc` / `completed`；原 finished 分支改为复用它 |
+| 3 | 同上 `HandleAgingStateAsync` | 终态分支在未全员终态时，除写 `terminal` 外**额外**把该设备移出 participants（仍在 terminal 集合中，批次结束判定不受影响）；移空则直接结束批次 |
+| 4 | 同上 | 新增 `HandleDeviceOfflineAsync(deviceId)`：校验 type=1、Mode=2、在当前批次 participants 内 → 剔除（`reason=device_offline`）→ 移空则结束批次 |
+| 5 | `Handlers/DeviceOfflineHandler.cs` | `SaveOfflineAsync` 后先调 `HandleDeviceOfflineAsync`，再 `ReevaluateMembershipAsync`（先剔除再重估，重估才会放行） |
+| 6 | `Services/GroupControlService.cs` `EvaluateNextStepUnsafeAsync` | 兜底：`participants.Count == 0` 时直接 `FinishRunUnsafeAsync`。空集合下 `All()` 恒真但被 `Count > 0` 挡住，既不放行也不结束，会挂死 |
+
+剔除原因取值：`aging_terminal`（自报终态）、`device_offline`（掉线）、`stage_timeout`（阶段超时，§7.1）。
+被剔除设备**本批次不回归**，重新上线也要等下一个 RunSeq。
+
+### 9.2 起表条件放宽
+
+`StageTimeoutRequireHalf`（默认 **false**）：只要有任意一台完成就起表。
+原实现要求 `completed >= Ceil(participants/2)`，多数设备异常时永远起不了表。
+置 true 可恢复旧行为。
+
+### 9.3 放行回复校验跳过离线设备
+
+- 新增 `FilterOnlineParticipantsAsync(n, participants)`（用 `GetOnlinePointDeviceIdsAsync`）。
+- `TryPublishNextStepUnsafeAsync`：只对在线设备 `StoreReleaseCommandsAsync` 与启动校验，差异记 Warning。
+- `VerifyReleaseRepliesAsync`：**每轮开始前**重新过滤一次（等待期间可能掉线）；全部离线时以
+  `clearedByOffline` 分支结束，不再误记"已收到全部确认"。
+
+### 9.4 AgingCommandGate 离线兜底释放
+
+- 新增配置 `AgingCommandGate:OfflineReleaseTimeoutMinutes`（默认 30，≤0 禁用）。
+- `WaitAndReserveAsync` 改为 `Task.WhenAny(stateChangedTask, Task.Delay(timeout))`；
+  超时且**设备已离线**才 `TryForceReleaseOfflineAsync` 强制开门；设备仍在线则继续等真实终态。
+- 只在离线时释放的原因：老化可能持续数小时，按时间无条件释放会让新 `start_aging` 插队穿透。
+
+### 9.5 配置项（本次新增）
+
+```json
+"GroupControl": {
+  "StageTimeoutRequireHalf": false,
+  "ExcludeOnAgingTerminal": true,
+  "ExcludeOnDeviceOffline": true,
+  "RaiseFaultOnExclusion": true
+},
+"AgingCommandGate": {
+  "OfflineReleaseTimeoutMinutes": 30
+}
+```
+
+### 9.6 验证
+
+`dotnet build DeviceService.slnx --no-incremental` → **0 错误**，6 个警告均为改动前既有。
+
+冒烟：
+- 单架 3 台，只让 1 台报 TaskCP、1 台报 `agingStop` → 该台应立即从 participants 消失（不必等 10 分钟），
+  剩余 2 台全部完成后放行；
+- 让 1 台断电发遗嘱 → participants 立即减一 + `excluded` 记入 + `event:fault` 一条；
+- 全部设备掉线 → 批次直接 finished，`CurrentRunSeq` 清空；
+- 设备掉线后下 start_aging → 30 分钟后门被强制释放并打 Warning（设备在线则不会）。
+
+### 9.7 仍未处理
+
+- **总控（type=2）掉线**：`CPower` 仍会保留 pending 并每 1s 重试刷日志，直到该架重新有唯一在线总控。
+  这是既有的"无总控/多总控保留 pending"设计，本次未改动。
+- 剔除设备重新上线后本批次不回归：如需"回归"能力，需要新增 `ExcludedRejoinMode=Rejoin` 与重新入集的时机判定。

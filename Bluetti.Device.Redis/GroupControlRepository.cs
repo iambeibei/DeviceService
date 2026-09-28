@@ -127,6 +127,36 @@ public sealed class GroupControlRepository
         => _redis.KeyDeleteAsync(
             RedisKeys.GroupControlRunCompletedDevices(agingNumber, runSeq));
 
+    /// <summary>
+    /// 将设备移出当前批次的固定参与集合。用于阶段超时后剔除未完成设备。
+    /// 剔除后这些设备的 TaskCP 会被判定为"非当前批次参与设备"而丢弃。
+    /// </summary>
+    public async Task RemoveRunParticipantsAsync(
+        string agingNumber,
+        long runSeq,
+        IEnumerable<string> deviceIds)
+    {
+        var key = RedisKeys.GroupControlRunParticipants(agingNumber, runSeq);
+        foreach (var deviceId in deviceIds.Distinct(StringComparer.Ordinal))
+            await _redis.SetRemoveAsync(key, RedisKeys.Normalize(deviceId));
+    }
+
+    public Task<bool> AddRunExcludedDeviceAsync(
+        string agingNumber,
+        long runSeq,
+        string deviceId)
+        => AddRunSetMemberAsync(
+            RedisKeys.GroupControlRunExcludedDevices(agingNumber, runSeq),
+            deviceId);
+
+    public async Task<IReadOnlySet<string>> GetRunExcludedDeviceIdsAsync(
+        string agingNumber,
+        long runSeq)
+        => new HashSet<string>(
+            await _redis.SetMembersAsync(
+                RedisKeys.GroupControlRunExcludedDevices(agingNumber, runSeq)),
+            StringComparer.Ordinal);
+
     public async Task<IReadOnlySet<string>> GetRunTerminalDeviceIdsAsync(
         string agingNumber,
         long runSeq)

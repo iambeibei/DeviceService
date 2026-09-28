@@ -19,15 +19,28 @@ public sealed class AgingCommandGate
     private readonly DeviceRepository _devices;
     private readonly ILogger<AgingCommandGate> _logger;
 
+    // 兜底：设备掉线后不再上报终态，等待超过该时长且设备已离线时强制释放发送门。
+    private readonly bool _offlineReleaseEnabled;
+    private readonly TimeSpan _offlineReleaseTimeout;
+
     private readonly ConcurrentDictionary<string, DeviceGate> _gates =
         new(StringComparer.Ordinal);
 
     public AgingCommandGate(
         DeviceRepository devices,
+        IConfiguration configuration,
         ILogger<AgingCommandGate> logger)
     {
         _devices = devices;
         _logger = logger;
+
+        var offlineReleaseMinutes = configuration.GetValue<double?>(
+            "AgingCommandGate:OfflineReleaseTimeoutMinutes") ?? 30;
+
+        _offlineReleaseEnabled = offlineReleaseMinutes > 0;
+        _offlineReleaseTimeout = _offlineReleaseEnabled
+            ? TimeSpan.FromMinutes(offlineReleaseMinutes)
+            : TimeSpan.Zero;
     }
 
     /// <summary>
@@ -72,8 +85,52 @@ public sealed class AgingCommandGate
                 state ?? "<empty>",
                 reserved);
 
-            await stateChangedTask.WaitAsync(cancellationToken);
+            if (!_offlineReleaseEnabled)
+            {
+                await stateChangedTask.WaitAsync(cancellationToken);
+                continue;
+            }
+
+            // 同时等待状态变化与兜底超时：设备掉线后不会再有终态事件，
+            // 只等事件会让该设备的 start_aging 永久排队。
+            await Task.WhenAny(
+                stateChangedTask,
+                Task.Delay(_offlineReleaseTimeout, cancellationToken));
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (stateChangedTask.IsCompleted)
+                continue;
+
+            // 超时仍未等到终态：只有设备确已离线才强制释放，
+            // 设备在线时老化可能仍在进行，继续等真实终态，不能强行插队。
+            await TryForceReleaseOfflineAsync(deviceId, gate);
         }
+    }
+
+    /// <summary>
+    /// 兜底释放：确认设备已离线后强制打开发送门。
+    /// 返回 true 表示已释放；false 表示设备仍在线，调用方应继续等待。
+    /// </summary>
+    private async Task<bool> TryForceReleaseOfflineAsync(string deviceId, DeviceGate gate)
+    {
+        var node = await _devices.GetAsync(deviceId);
+        if (node is not null && node.Online)
+            return false;
+
+        lock (gate.SyncRoot)
+        {
+            gate.Reserved = false;
+            Pulse(gate);
+        }
+
+        _logger.LogWarning(
+            "start_aging 发送门等待超时且设备已离线，强制释放发送门，DeviceId={DeviceId}, TimeoutMinutes={TimeoutMinutes}, Online={Online}, AgingState={AgingState}",
+            deviceId,
+            _offlineReleaseTimeout.TotalMinutes,
+            node?.Online.ToString() ?? "<unknown>",
+            gate.AgingState ?? "<empty>");
+
+        return true;
     }
 
     /// <summary>

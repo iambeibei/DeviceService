@@ -16,6 +16,20 @@ public sealed class GroupControlState
     public string LastAppliedControllerId { get; set; } = string.Empty;
     public string PendingNextStep { get; set; } = string.Empty;
     public string PendingPower { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 阶段放行倒计时的到期时刻（UTC）。
+    /// 仅在当前阶段的完成设备数达到参与集合半数、但尚未全覆盖时设置；
+    /// 全覆盖放行、超时剔除、批次结束、模式切换时清空。为 null 表示未计时。
+    /// 持久化在 state 中，服务重启后倒计时继续有效。
+    /// </summary>
+    public DateTime? StageDeadlineUtc { get; set; }
+
+    /// <summary>
+    /// 最近一次因阶段超时而触发剔除/放行的批次序号，用于审计追溯。
+    /// </summary>
+    public long? LastStageTimeoutSeq { get; set; }
+
     public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
 }
 

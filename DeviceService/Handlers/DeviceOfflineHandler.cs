@@ -65,6 +65,10 @@ public sealed class DeviceOfflineHandler : IMqttMessageHandler
                 deviceType,
                 seq,
                 payload);
+
+            // 先剔除屏障成员，再重估该架：
+            // 掉线设备不再上报阶段完成，若不移出 participants 会永久阻塞整架放行。
+            await _groupControl.HandleDeviceOfflineAsync(deviceId);
             await _groupControl.ReevaluateMembershipAsync(
                 previous?.AgingNumber,
                 currentAgingNumber: null);

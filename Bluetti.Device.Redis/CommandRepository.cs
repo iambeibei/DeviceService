@@ -188,6 +188,35 @@ public sealed class CommandRepository
     /// timed_out 是命令回复层面的终态，不做自动重发。
     /// 是否放行业务上的下一条任务由上层 Worker 决定：普通命令可继续，start_aging 仍需等待设备状态退出。
     /// </summary>
+    /// <summary>
+    /// 强制把命令状态改回 published，供"重发后重新等待回复"使用。
+    ///
+    /// 必须走本方法而不是 MarkPublishedAsync / MarkQueuedAsync：那两个方法都有终态保护，
+    /// 命令一旦进入 completed / failed / timed_out 就会直接 return，不会重置；
+    /// 而 WaitForCompletionAsync 发现命令已处于终态时会立即返回、根本不等待。
+    /// 因此重试前若不先重置，第二次等待会瞬间结束，重试形同虚设。
+    /// </summary>
+    public async Task ResetForRetryAsync(string deviceId, long cmdSeq)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+        if (cmdSeq <= 0)
+            throw new ArgumentOutOfRangeException(nameof(cmdSeq), "命令序号必须大于 0");
+
+        var key = RedisKeys.DeviceCommandStatus(deviceId, cmdSeq);
+        var existing = await _redis.HashToObjectAsync<CmdInfo>(key);
+        if (existing is null)
+            return;
+
+        existing.Status = CommandStates.Published;
+        existing.CompletedAtUtc = null;
+        existing.TimedOutAtUtc = null;
+        existing.ResultCode = null;
+        existing.ResultMessage = null;
+        existing.ReplyType = null;
+        existing.ReplyJson = null;
+        await _redis.ObjectToHashAsync(key, existing, CommandTtl);
+    }
+
     public async Task<CmdInfo> MarkTimedOutAsync(CmdInfo command, TimeSpan timeout)
     {
         var current = await GetAsync(command.DeviceId, command.Seq) ?? command;
