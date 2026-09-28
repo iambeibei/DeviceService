@@ -417,6 +417,8 @@ public sealed class DeviceRepository
                 new HashEntry("CurrentStep", currentStep?.ToString() ?? string.Empty)
             ]);
 
+        // 老化采样历史设置统一过期时间，每次采样都会刷新整条流的过期时间。
+        // 某 PN 停止采样超过 RedisTtl.DeviceAgingHistory 后，该历史流会被整键删除。
         await _redis.StreamAddAsync(
             RedisKeys.DeviceAgingHistory(deviceId, pn),
             [
@@ -428,7 +430,8 @@ public sealed class DeviceRepository
                 new NameValueEntry("payload", rawPayload),
                 new NameValueEntry("receivedAtUtc", now.ToString("O"))
             ],
-            maxLength: 100_000);
+            maxLength: 100_000,
+            ttl: RedisTtl.DeviceAgingHistory);
     }
 
     /// <summary>

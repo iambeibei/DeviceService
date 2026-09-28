@@ -25,6 +25,7 @@ Action 与回复主题映射：`get_state` → `state`，`set_pn` → `pn`，`ge
 ## 关键约定与陷阱
 
 - **Redis 键前缀以代码为准**：`RedisKeys.Prefix = "lgw"`。若看到历史/示例文档出现其它前缀（如 `lgw:` 或 `lgwtest2`）一律视为过时，不要照抄。
+- **Redis 过期时间统一由 `RedisTtl.cs` 控制**：改 `DefaultDays` 即可调整，不要在各 Repository 里写私有 TTL 常量。当前**只有两类键设过期**：`lgw:device:{id}:cmd:{seq}`（命令 Hash）与 `lgw:device:{id}:aging:{pn}:history`（采样历史 Stream）。给新键加 TTL 前必须先看 `RedisTtl` 的注释清单：`lgw:cmd:seq`（Seq 回退）、`lgw:cmd:queue`（整键过期会连消费者组 `device-service` 一起消失，而消费组只在启动时创建一次 → 之后持续 NOGROUP 卡死，只能靠 MAXLEN 裁剪）、`runtime` 与 `event:state`（老化任务关联恢复源）、在线列表与设备目录、`group-control:racks` 与 `{n}:state` **一律不设过期**。另注意 TTL 是整键删除，不是按条目裁剪。
 - 本项目当前无 `*.md` 协议/变更文档（历史引用的 `REDIS_STRUCTURE.md`、`CHANGELOG_LATEST_PROTOCOL.md` 已不存在），改动协议/行为时以 `RedisKeys.cs` 与 `AGENTS.md` 为准。
 - 同设备命令严格串行（收到回复或超时才发下一条）；不同设备并行。`start_aging` 走独立队列 + `AgingCommandGate` 门控：只有设备上报 `agingIdle / agingStop / agingError` 才放行下一条，`timed_out` 不释放门。
 - 全链路至少一次投递：重启恢复会用原 Seq 重发 MQTT，设备端按 `Seq/CmdSeq` 幂等去重是前提。不要把"published 状态"当作"一定已发送成功"。

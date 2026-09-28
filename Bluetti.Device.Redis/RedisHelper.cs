@@ -115,19 +115,40 @@ public sealed class RedisHelper
         return value;
     }
 
-    public Task<RedisValue> StreamAddAsync(
+    /// <summary>
+    /// 写入 Stream。ttl 为空表示不设过期（默认）；
+    /// 传入 RedisTtl 中的值时，每次写入都会刷新整个 Stream 键的过期时间。
+    /// 注意：过期是整键删除，不是按条目裁剪，历史流会整体消失。
+    /// </summary>
+    public async Task<RedisValue> StreamAddAsync(
         string streamKey,
         NameValueEntry[] entries,
         int? maxLength = null,
-        bool approximate = true)
-        => _db.StreamAddAsync(streamKey, entries, maxLength: maxLength, useApproximateMaxLength: approximate);
+        bool approximate = true,
+        TimeSpan? ttl = null)
+    {
+        var id = await _db.StreamAddAsync(
+            streamKey,
+            entries,
+            maxLength: maxLength,
+            useApproximateMaxLength: approximate);
 
-    public async Task ObjectToStreamAsync<T>(string streamKey, T model, int? maxLength = null)
+        if (ttl.HasValue)
+            await _db.KeyExpireAsync(streamKey, ttl.Value);
+
+        return id;
+    }
+
+    public async Task ObjectToStreamAsync<T>(
+        string streamKey,
+        T model,
+        int? maxLength = null,
+        TimeSpan? ttl = null)
         where T : class
     {
         ArgumentNullException.ThrowIfNull(model);
         var json = JsonConvert.SerializeObject(model);
-        await StreamAddAsync(streamKey, [new NameValueEntry("data", json)], maxLength);
+        await StreamAddAsync(streamKey, [new NameValueEntry("data", json)], maxLength, ttl: ttl);
     }
 
     public async Task EnsureConsumerGroupAsync(string streamKey, string groupName, string startPosition = "0-0")

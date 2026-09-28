@@ -8,7 +8,9 @@ namespace Bluetti.Device.Redis;
 public sealed class CommandRepository
 {
     public const string ConsumerGroup = "device-service";
-    private static readonly TimeSpan CommandTtl = TimeSpan.FromDays(7);
+
+    // 命令 Hash 的过期时间统一由 RedisTtl.Command 控制（默认 7 天，修改见 RedisTtl.DefaultDays）。
+    private static readonly TimeSpan CommandTtl = RedisTtl.Command;
     private readonly RedisHelper _redis;
 
     // 仅用于当前进程内“命令回复唤醒”。命令最终状态仍以 Redis Hash 为准。
