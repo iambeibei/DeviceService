@@ -218,11 +218,34 @@ public sealed class RedisCmdWorker : BackgroundService
 
     /// <summary>
     /// 根据 DeviceId 将拆分后的单设备命令投递到原有设备队列。
+    /// start_aging 在创建老化专用队列（及其 AgingCommandGate 发送门）之前，
+    /// 先通过 lgw:devices:online 检查设备是否在线；离线则不创建门控并直接结束该命令。
     /// </summary>
     private async Task DispatchAsync(BatchAckTracker batch, CmdInfo command, CancellationToken ct)
     {
         var deviceId = RedisKeys.Normalize(command.DeviceId);
         command.DeviceId = deviceId;
+
+        var isStartAging = IsStartAging(command.Action);
+
+        if (isStartAging && !await _devices.IsDeviceOnlineAsync(deviceId))
+        {
+            // 离线设备收不到 MQTT 指令，也不会再上报 agingStart / 终态，
+            // 为它创建老化门控只会让命令在队列里永久等待，因此这里不创建
+            // 设备老化专用队列和 AgingCommandGate 发送门，直接结束该命令。
+            _logger.LogWarning(
+                "start_aging 目标设备不在线，不创建老化门控，命令标记失败，DeviceId={DeviceId}, Seq={Seq}, StreamId={StreamId}",
+                deviceId,
+                command.Seq,
+                batch.MessageId);
+
+            await _commands.MarkFailedAsync(
+                command,
+                "设备不在线（未出现在 lgw:devices:online），拒绝创建老化门控");
+
+            await CompleteBatchItemAsync(batch, deviceId, command.Seq);
+            return;
+        }
 
         _logger.LogInformation(
             "Redis 命令已进入设备串行队列，DeviceId={DeviceId}, Action={Action}, Seq={Seq}, StreamId={StreamId}",
@@ -231,7 +254,6 @@ public sealed class RedisCmdWorker : BackgroundService
             command.Seq,
             batch.MessageId);
 
-        var isStartAging = IsStartAging(command.Action);
         var queue = isStartAging
             ? _agingQueues.GetOrAdd(deviceId, id => CreateAgingQueue(id, ct))
             : _deviceQueues.GetOrAdd(deviceId, id => CreateDeviceQueue(id, ct));

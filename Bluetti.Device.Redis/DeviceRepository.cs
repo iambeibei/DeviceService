@@ -586,6 +586,37 @@ public sealed class DeviceRepository
     public Task<string[]> GetOnlineDeviceJsonListAsync()
         => _redis.ListRangeAsync(RedisKeys.OnlineDeviceList, 0, -1);
 
+    /// <summary>
+    /// 通过全量在线 List（lgw:devices:online）判断设备是否在线。
+    /// 该列表由上线/下线处理器专门维护，是在线状态的权威来源；
+    /// runtime.Online 会被任意业务消息刷新，因此创建老化门控前统一以本方法为准。
+    /// </summary>
+    public async Task<bool> IsDeviceOnlineAsync(string deviceId)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+        var items = await _redis.ListRangeAsync(RedisKeys.OnlineDeviceList, 0, -1);
+
+        foreach (var item in items)
+        {
+            if (string.IsNullOrWhiteSpace(item))
+                continue;
+
+            try
+            {
+                var json = JObject.Parse(item);
+                var id = json.GetValue("id", StringComparison.OrdinalIgnoreCase)?.Value<string>();
+                if (string.Equals(id, deviceId, StringComparison.Ordinal))
+                    return true;
+            }
+            catch (JsonException)
+            {
+                // 非法历史元素不参与在线判断。
+            }
+        }
+
+        return false;
+    }
+
     public Task<string[]> GetAgingRackOnlineDeviceJsonListAsync(string agingNumber)
         => _redis.ListRangeAsync(
             RedisKeys.AgingRackOnlineDeviceList(agingNumber),

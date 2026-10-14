@@ -184,6 +184,33 @@ public sealed class CommandRepository
     }
 
     /// <summary>
+    /// 服务端主动把命令标记为 failed，用于命令尚未下发就已确定失败的场景，
+    /// 例如 start_aging 目标设备不在线、拒绝创建老化门控。
+    /// 与 CompleteAsync 的区别：本方法不依赖设备回复。
+    /// 已处于终态（completed / failed / timed_out）的命令不会被覆盖。
+    /// </summary>
+    public async Task<CmdInfo> MarkFailedAsync(CmdInfo command, string reason)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+
+        var current = await GetAsync(command.DeviceId, command.Seq) ?? command;
+        if (CommandStates.IsTerminal(current.Status))
+            return current;
+
+        current.Status = CommandStates.Failed;
+        current.CompletedAtUtc = DateTime.UtcNow;
+        current.TimedOutAtUtc = null;
+        current.ResultCode = null;
+        current.ResultMessage = reason;
+        current.ReplyType = null;
+        current.ReplyJson = null;
+        await _redis.ObjectToHashAsync(current.StatusKey, current, CommandTtl);
+
+        SignalCompletion(current);
+        return current;
+    }
+
+    /// <summary>
     /// 设备在规定时间内没有返回对应 CmdSeq 时，将该命令标记为 timed_out。
     /// timed_out 是命令回复层面的终态，不做自动重发。
     /// 是否放行业务上的下一条任务由上层 Worker 决定：普通命令可继续，start_aging 仍需等待设备状态退出。
