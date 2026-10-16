@@ -30,6 +30,7 @@ public sealed class RedisCmdWorker : BackgroundService
     private readonly MqttConnection _mqtt;
     private readonly AgingCommandGate _agingGate;
     private readonly GroupControlService _groupControl;
+    private readonly OtaUpgradeService _otaUpgrade;
     private readonly ILogger<RedisCmdWorker> _logger;
     private readonly string _consumerName;
     private readonly TimeSpan _replyTimeout;
@@ -48,6 +49,7 @@ public sealed class RedisCmdWorker : BackgroundService
         MqttConnection mqtt,
         AgingCommandGate agingGate,
         GroupControlService groupControl,
+        OtaUpgradeService otaUpgrade,
         IConfiguration configuration,
         ILogger<RedisCmdWorker> logger)
     {
@@ -56,6 +58,7 @@ public sealed class RedisCmdWorker : BackgroundService
         _mqtt = mqtt;
         _agingGate = agingGate;
         _groupControl = groupControl;
+        _otaUpgrade = otaUpgrade;
         _logger = logger;
 
         _consumerName = configuration.GetValue<string>("RedisSettings:ConsumerName")?? Environment.MachineName;
@@ -227,6 +230,45 @@ public sealed class RedisCmdWorker : BackgroundService
         command.DeviceId = deviceId;
 
         var isStartAging = IsStartAging(command.Action);
+        var isOta = IsOta(command.Action);
+
+        // ota 指令同样先查在线：离线设备收不到指令，也不会上报 OTACP，
+        // 若计入批次下发数，批次永远凑不齐，只能干等超时兜底。
+        if (isOta && !await _devices.IsDeviceOnlineAsync(deviceId))
+        {
+            _logger.LogWarning(
+                "ota 目标设备不在线，拒绝下发，DeviceId={DeviceId}, Seq={Seq}, StreamId={StreamId}",
+                deviceId,
+                command.Seq,
+                batch.MessageId);
+
+            await _commands.MarkFailedAsync(
+                command,
+                "设备不在线（未出现在 lgw:devices:online），拒绝下发 ota 指令");
+
+            await CompleteBatchItemAsync(batch, deviceId, command.Seq);
+            return;
+        }
+
+        if (isOta)
+        {
+            // 同架已有未完成 OTA 批次、或设备没有架号时拒绝下发，避免两批互相打断。
+            var decision = await _otaUpgrade.BeginDispatchAsync(deviceId, command.Seq);
+            if (!decision.Allowed)
+            {
+                _logger.LogWarning(
+                    "ota 指令未通过批次准入，DeviceId={DeviceId}, Seq={Seq}, AgingNumber={AgingNumber}, Reason={Reason}, StreamId={StreamId}",
+                    deviceId,
+                    command.Seq,
+                    decision.AgingNumber,
+                    decision.Reason,
+                    batch.MessageId);
+
+                await _commands.MarkFailedAsync(command, decision.Reason);
+                await CompleteBatchItemAsync(batch, deviceId, command.Seq);
+                return;
+            }
+        }
 
         if (isStartAging && !await _devices.IsDeviceOnlineAsync(deviceId))
         {
@@ -462,7 +504,19 @@ public sealed class RedisCmdWorker : BackgroundService
             {
                 try
                 {
-                    _ = await ProcessOneCommandAsync(deviceId, item, ct);
+                    _ = await ProcessOneCommandAsync(
+                        deviceId,
+                        item,
+                        ct,
+                        onPublished: async () =>
+                        {
+                            // ota 指令真正发布成功才计入批次下发数，
+                            // 批次据此判断"下发数量"并在全部完成后广播重启。
+                            if (IsOta(item.Command.Action))
+                                await _otaUpgrade.RecordDispatchAsync(
+                                    deviceId,
+                                    item.Command.Seq);
+                        });
                     break;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -614,6 +668,9 @@ public sealed class RedisCmdWorker : BackgroundService
 
     private static bool IsStartAging(string action)
         => string.Equals(action?.Trim(), "start_aging", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsOta(string action)
+        => string.Equals(action?.Trim(), "ota", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsAgingStartState(string? state)
         => string.Equals(state?.Trim(), "agingStart", StringComparison.OrdinalIgnoreCase);

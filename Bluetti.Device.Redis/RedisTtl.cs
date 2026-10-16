@@ -17,6 +17,7 @@ namespace Bluetti.Device.Redis;
 ///   AgingNumber 的恢复源，过期会让运行中的批次永远无法结束；
 /// - 在线列表与设备目录（lgw:devices、devices:last_seen、devices:online*）：由上下线生命周期维护；
 /// - lgw:group-control:racks 与 lgw:group-control:{n}:state：架注册表与架当前状态，过期等于整架重置。
+/// - lgw:ota:racks：OTA 架注册表，过期会让服务重启后扫不到历史批次（批次本身仍可恢复），故不设过期。
 /// </summary>
 public static class RedisTtl
 {
@@ -39,4 +40,11 @@ public static class RedisTtl
     /// 每次采样写入都会刷新过期时间；某 PN 停止采样超过该天数后整条历史会被删除。
     /// </summary>
     public static readonly TimeSpan DeviceAgingHistory = Default;
+
+    /// <summary>
+    /// OTA 批次：lgw:ota:{AgingNumber}:run:{seq}:state / dispatched / completed，以及 active。
+    /// 批次正常结束时 active 会被主动删除，这里只是防止服务异常退出后残留的 active
+    /// 永久阻塞该架的下一次 ota 指令。批次本身只用于审计追溯，过期不影响业务。
+    /// </summary>
+    public static readonly TimeSpan OtaBatch = Default;
 }

@@ -19,7 +19,8 @@ public sealed class AgingCommandGate
     private readonly DeviceRepository _devices;
     private readonly ILogger<AgingCommandGate> _logger;
 
-    // 兜底：设备掉线后不再上报终态，等待超过该时长且设备已离线时强制释放发送门。
+    // 兜底：设备掉线后不再上报终态，等待超过该时长且设备已离线时强制释放发送门，
+    // 并允许一条 start_aging 穿透 agingStart；AgingState 本身保持不变。
     private readonly bool _offlineReleaseEnabled;
     private readonly TimeSpan _offlineReleaseTimeout;
 
@@ -66,13 +67,18 @@ public sealed class AgingCommandGate
                 state = gate.AgingState;
                 reserved = gate.Reserved;
 
-                if (!reserved && !IsAgingStart(state))
+                // 兜底释放后允许本轮穿透一次 agingStart。
+                // 只穿透一条：占用门的同时清掉标记，排队的后续命令继续按真实状态排队。
+                var forceReleased = gate.ForceReleased;
+                if (!reserved && (!IsAgingStart(state) || forceReleased))
                 {
                     gate.Reserved = true;
+                    gate.ForceReleased = false;
                     _logger.LogInformation(
-                        "start_aging 已取得发送资格，DeviceId={DeviceId}, AgingState={AgingState}",
+                        "start_aging 已取得发送资格，DeviceId={DeviceId}, AgingState={AgingState}, ForceReleased={ForceReleased}",
                         deviceId,
-                        state ?? "<empty>");
+                        state ?? "<empty>",
+                        forceReleased);
                     return;
                 }
 
@@ -113,21 +119,27 @@ public sealed class AgingCommandGate
     /// </summary>
     private async Task<bool> TryForceReleaseOfflineAsync(string deviceId, DeviceGate gate)
     {
-        var node = await _devices.GetAsync(deviceId);
-        if (node is not null && node.Online)
+        // 在线状态以全量在线 List 为准：runtime.Online 会被任意业务消息刷新成 true，
+        // 用它判断会把已经离线的设备误判成在线，发送门继续无限等待。
+        if (await _devices.IsDeviceOnlineAsync(deviceId))
             return false;
 
         lock (gate.SyncRoot)
         {
             gate.Reserved = false;
+
+            // 仅清 Reserved 不足以放行：放行条件还要求 AgingState 不是 agingStart，
+            // 而掉线设备不会再上报终态，内存里会一直是 agingStart。
+            // 这里打一个"本轮豁免"标记让一条命令穿透，AgingState 本身保持不变，
+            // 避免影响 RedisCmdWorker 依据该状态判断"是否重发已发布的老化命令"。
+            gate.ForceReleased = true;
             Pulse(gate);
         }
 
         _logger.LogWarning(
-            "start_aging 发送门等待超时且设备已离线，强制释放发送门，DeviceId={DeviceId}, TimeoutMinutes={TimeoutMinutes}, Online={Online}, AgingState={AgingState}",
+            "start_aging 发送门等待超时且设备已离线，强制释放发送门并允许本轮穿透，DeviceId={DeviceId}, TimeoutMinutes={TimeoutMinutes}, AgingState={AgingState}",
             deviceId,
             _offlineReleaseTimeout.TotalMinutes,
-            node?.Online.ToString() ?? "<unknown>",
             gate.AgingState ?? "<empty>");
 
         return true;
@@ -150,6 +162,10 @@ public sealed class AgingCommandGate
         {
             gate.Initialized = true;
             gate.AgingState = agingState.Trim();
+
+            // 真实状态到达后一律以它为准，之前的兜底豁免立即作废。
+            // 设备重新上线若仍上报 agingStart，门会再次关闭，不会打断正在进行的老化。
+            gate.ForceReleased = false;
 
             if (normalizedState == "agingstart")
             {
@@ -196,6 +212,7 @@ public sealed class AgingCommandGate
             if (!IsAgingStart(gate.AgingState))
             {
                 gate.Reserved = false;
+                gate.ForceReleased = false;
                 Pulse(gate);
             }
         }
@@ -285,6 +302,13 @@ public sealed class AgingCommandGate
         public SemaphoreSlim InitializeLock { get; } = new(1, 1);
         public bool Initialized;
         public bool Reserved;
+
+        /// <summary>
+        /// 离线兜底释放后允许一条 start_aging 穿透 agingStart 状态。
+        /// 只作用于一次放行，占用发送门时立即清除；真实状态上报也会清除。
+        /// </summary>
+        public bool ForceReleased;
+
         public string? AgingState;
         public TaskCompletionSource<bool> StateChanged = CreateSignal();
     }

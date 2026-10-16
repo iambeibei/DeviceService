@@ -28,6 +28,27 @@ public static class MqttTopic
         return !string.IsNullOrWhiteSpace(deviceId);
     }
 
+    /// <summary>
+    /// device/{deviceId}/event/OTACP：子节点 OTA 下载完成上报。
+    /// 与 TaskCP 的区别是这里不携带 ota 指令 Seq，批次归属由服务端按 deviceId 反查。
+    /// </summary>
+    public static bool TryGetOtaCompletionDeviceId(string topic, out string deviceId)
+    {
+        deviceId = string.Empty;
+        var parts = Split(topic);
+        if (parts.Length != 4 ||
+            !parts[0].Equals("device", StringComparison.OrdinalIgnoreCase) ||
+            parts[1].Equals("public", StringComparison.OrdinalIgnoreCase) ||
+            !parts[2].Equals("event", StringComparison.OrdinalIgnoreCase) ||
+            !parts[3].Equals("OTACP", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        deviceId = parts[1];
+        return !string.IsNullOrWhiteSpace(deviceId);
+    }
+
     public static bool TryGetDeviceId(string topic, out string deviceId)
     {
         deviceId = string.Empty;

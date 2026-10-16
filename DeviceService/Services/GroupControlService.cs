@@ -50,6 +50,10 @@ public sealed class GroupControlService : BackgroundService
     private readonly bool _excludeOnDeviceOffline;
     private readonly bool _raiseFaultOnExclusion;
 
+    // 被剔除设备重新上报 agingStart 后是否允许回归本批次，以及回归时限。
+    private readonly bool _excludedRejoinEnabled;
+    private readonly TimeSpan _excludedRejoinTimeout;
+
     // 阶段倒计时是否仍要求"完成数达到半数"才起表。
     private readonly bool _stageTimeoutRequireHalf;
 
@@ -125,6 +129,18 @@ public sealed class GroupControlService : BackgroundService
 
         _raiseFaultOnExclusion = configuration.GetValue<bool?>(
             "GroupControl:RaiseFaultOnExclusion") ?? true;
+
+        // 默认开启：网络抖动导致的短时掉线不应剥夺设备本批次资格。
+        // 置 "None" 可恢复"剔除后本批次不再回归"的旧行为。
+        var rejoinMode = configuration.GetValue<string>(
+            "GroupControl:ExcludedRejoinMode") ?? "OfflineWithinTimeout";
+        _excludedRejoinEnabled = !rejoinMode.Equals("None", StringComparison.OrdinalIgnoreCase);
+
+        var rejoinTimeoutMinutes = configuration.GetValue<double?>(
+            "GroupControl:ExcludedRejoinTimeoutMinutes") ?? 10;
+        _excludedRejoinTimeout = rejoinTimeoutMinutes > 0
+            ? TimeSpan.FromMinutes(rejoinTimeoutMinutes)
+            : TimeSpan.Zero;
 
         // 默认 false：只要有任意一台完成就起表。设为 true 则恢复"必须过半数"的旧行为。
         _stageTimeoutRequireHalf = configuration.GetValue<bool?>(
@@ -271,6 +287,23 @@ public sealed class GroupControlService : BackgroundService
                     deviceId,
                     "设备真实上报 agingStart");
 
+                // 本批次已被剔除的设备重新上报 agingStart，说明下位机仍在跑本批任务
+                // （网络抖动后恢复，而不是掉电重启后任务丢失）。此时才尝试让它回归本批次。
+                // 判定点必须是这里而不是上线消息：runtime.AgingState 只在状态上报时更新，
+                // 上线瞬间读到的仍是掉线前的残留值，区分不出这两种情况。
+                if (!activated &&
+                    state.CurrentRunSeq.HasValue &&
+                    state.CurrentRunSeq.Value == runSeq.Value)
+                {
+                    var rejoined = await TryRejoinExcludedParticipantUnsafeAsync(
+                        agingNumber,
+                        state,
+                        runSeq.Value,
+                        deviceId);
+                    if (rejoined)
+                        return;
+                }
+
                 // 兼容升级前已经发布、但因 mode 消息到达较晚而没有登记候选批次的任务。
                 // 恢复只依据真实 agingStart + 设备自身的 CurrentAgingSeq/TaskQueue，
                 // 不使用在线列表，也不会由 TaskCP 反向创建批次。
@@ -324,8 +357,9 @@ public sealed class GroupControlService : BackgroundService
                         agingNumber,
                         runSeq.Value,
                         deviceId,
-                        "aging_terminal",
-                        $"设备上报 {agingState} 退出老化，已移出当前批次阶段放行屏障，AgingNumber={agingNumber}, RunSeq={runSeq.Value}, Stage={state.CurrentStage}");
+                        GroupControlRunExcludeReasons.AgingTerminal,
+                        $"设备上报 {agingState} 退出老化，已移出当前批次阶段放行屏障，AgingNumber={agingNumber}, RunSeq={runSeq.Value}, Stage={state.CurrentStage}",
+                        state.CurrentStage);
 
                     var remaining = await _repository.GetRunParticipantsAsync(
                         agingNumber,
@@ -560,7 +594,8 @@ public sealed class GroupControlService : BackgroundService
     /// <summary>
     /// 设备掉线（MQTT 遗嘱）后把它移出当前批次的阶段放行屏障。
     /// 掉线设备不会再上报 TaskCP，若不剔除会永久阻塞整架放行。
-    /// 剔除后本批次不再等待它；重新上线也不会回归本批次，需等下一个 RunSeq。
+    /// 剔除后本批次不再等待它；若它在回归时限内重新上报 agingStart，
+    /// 由 TryRejoinExcludedParticipantUnsafeAsync 重新纳入本批次，否则需等下一个 RunSeq。
     /// </summary>
     public async Task HandleDeviceOfflineAsync(string deviceId)
     {
@@ -609,8 +644,9 @@ public sealed class GroupControlService : BackgroundService
                 agingNumber,
                 runSeq,
                 deviceId,
-                "device_offline",
-                $"设备离线，已移出当前批次阶段放行屏障，AgingNumber={agingNumber}, RunSeq={runSeq}, Stage={state.CurrentStage}");
+                GroupControlRunExcludeReasons.DeviceOffline,
+                $"设备离线，已移出当前批次阶段放行屏障，AgingNumber={agingNumber}, RunSeq={runSeq}, Stage={state.CurrentStage}",
+                state.CurrentStage);
 
             // 兜底：参与集合被清空后既不会放行也不会结束，直接收尾。
             var remaining = await _repository.GetRunParticipantsAsync(agingNumber, runSeq);
@@ -1285,10 +1321,23 @@ public sealed class GroupControlService : BackgroundService
         long runSeq,
         string deviceId,
         string reason,
-        string message)
+        string message,
+        string? stage)
     {
         await _repository.RemoveRunParticipantsAsync(agingNumber, runSeq, [deviceId]);
         await _repository.AddRunExcludedDeviceAsync(agingNumber, runSeq, deviceId);
+
+        // 剔除时刻与当时阶段决定这台设备后续能否回归本批次，必须同时落库。
+        await _repository.SetRunExcludedMetaAsync(
+            agingNumber,
+            runSeq,
+            new GroupControlRunExcludedMeta
+            {
+                DeviceId = RedisKeys.Normalize(deviceId),
+                Reason = reason,
+                Stage = stage ?? string.Empty,
+                ExcludedAtUtc = DateTime.UtcNow
+            });
 
         if (_raiseFaultOnExclusion)
         {
@@ -1310,6 +1359,93 @@ public sealed class GroupControlService : BackgroundService
             deviceId,
             reason,
             _raiseFaultOnExclusion);
+    }
+
+    /// <summary>
+    /// 设备被移出参与集合后重新上报 agingStart 时，尝试让它回归本批次。
+    ///
+    /// 只有「因离线被剔除」且「仍在回归时限内」的设备才允许回归：网络抖动导致的短时掉线
+    /// 不应剥夺本批次资格，而长时间离线的设备已落后于全架进度，回归意义不大。
+    /// 终态剔除与超时剔除不回归：前者已退出老化，后者是本阶段确实没做完。
+    ///
+    /// 阶段对齐：若剔除期间全架已推进到下一阶段，设备错过了本阶段放行，
+    /// 直接按未完成者等待会永久阻塞整架（放行指令不会为单台补发）。
+    /// 因此这种情况下把它计为当前阶段已完成，本阶段豁免，从下一阶段起正常参与。
+    /// 调用方必须持有对应老化架锁。
+    /// </summary>
+    private async Task<bool> TryRejoinExcludedParticipantUnsafeAsync(
+        string agingNumber,
+        GroupControlState state,
+        long runSeq,
+        string deviceId)
+    {
+        if (!_excludedRejoinEnabled || _excludedRejoinTimeout <= TimeSpan.Zero)
+            return false;
+
+        var meta = await _repository.GetRunExcludedMetaAsync(agingNumber, runSeq, deviceId);
+        if (meta is null)
+            return false;
+
+        if (!string.Equals(
+                meta.Reason,
+                GroupControlRunExcludeReasons.DeviceOffline,
+                StringComparison.Ordinal))
+        {
+            _logger.LogInformation(
+                "剔除原因不允许回归本批次，AgingNumber={AgingNumber}, RunSeq={RunSeq}, DeviceId={DeviceId}, Reason={Reason}",
+                agingNumber,
+                runSeq,
+                deviceId,
+                meta.Reason);
+            return false;
+        }
+
+        // 反序列化后 Kind 未必是 Utc，统一折算再比较，避免本机时区把离线时长算短 8 小时。
+        var excludedAtUtc = meta.ExcludedAtUtc.Kind == DateTimeKind.Local
+            ? meta.ExcludedAtUtc.ToUniversalTime()
+            : meta.ExcludedAtUtc;
+        var offlineDuration = DateTime.UtcNow - excludedAtUtc;
+        if (offlineDuration > _excludedRejoinTimeout)
+        {
+            _logger.LogWarning(
+                "设备离线时长已超过回归时限，拒绝回归本批次，AgingNumber={AgingNumber}, RunSeq={RunSeq}, DeviceId={DeviceId}, OfflineMinutes={OfflineMinutes}, TimeoutMinutes={TimeoutMinutes}",
+                agingNumber,
+                runSeq,
+                deviceId,
+                offlineDuration.TotalMinutes,
+                _excludedRejoinTimeout.TotalMinutes);
+            return false;
+        }
+
+        var stageAdvanced = !string.Equals(
+            meta.Stage,
+            state.CurrentStage,
+            StringComparison.Ordinal);
+
+        await _repository.RemoveRunExcludedDeviceAsync(agingNumber, runSeq, deviceId);
+        await _repository.AddRunParticipantsAsync(agingNumber, runSeq, [deviceId]);
+        await _repository.AddRunStartedDeviceAsync(agingNumber, runSeq, deviceId);
+
+        if (stageAdvanced)
+            await _repository.AddRunCompletedDeviceAsync(agingNumber, runSeq, deviceId);
+
+        _logger.LogWarning(
+            "设备已回归当前群控批次，AgingNumber={AgingNumber}, RunSeq={RunSeq}, DeviceId={DeviceId}, OfflineSeconds={OfflineSeconds}, ExcludedStage={ExcludedStage}, CurrentStage={CurrentStage}, CurrentStageWaived={CurrentStageWaived}",
+            agingNumber,
+            runSeq,
+            deviceId,
+            offlineDuration.TotalSeconds,
+            meta.Stage,
+            state.CurrentStage,
+            stageAdvanced);
+
+        // 回归后重新评估本阶段：阶段已推进时它已计入完成，可能立刻满足放行。
+        await EvaluateNextStepUnsafeAsync(
+            agingNumber,
+            state,
+            CancellationToken.None);
+
+        return true;
     }
 
     /// <summary>
@@ -1395,7 +1531,19 @@ public sealed class GroupControlService : BackgroundService
 
         await _repository.RemoveRunParticipantsAsync(agingNumber, runSeq, expired);
         foreach (var deviceId in expired)
+        {
             await _repository.AddRunExcludedDeviceAsync(agingNumber, runSeq, deviceId);
+            await _repository.SetRunExcludedMetaAsync(
+                agingNumber,
+                runSeq,
+                new GroupControlRunExcludedMeta
+                {
+                    DeviceId = RedisKeys.Normalize(deviceId),
+                    Reason = GroupControlRunExcludeReasons.StageTimeout,
+                    Stage = state.CurrentStage,
+                    ExcludedAtUtc = DateTime.UtcNow
+                });
+        }
 
         if (_raiseFaultOnStageTimeout)
         {

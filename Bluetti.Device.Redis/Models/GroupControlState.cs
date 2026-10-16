@@ -48,6 +48,30 @@ public sealed class GroupControlRunState
     public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
 }
 
+/// <summary>
+/// 设备被移出当前批次参与集合时保留的上下文。
+/// 剔除原因、剔除时所处阶段和剔除时刻共同决定设备能否回归本批次。
+/// </summary>
+public sealed class GroupControlRunExcludedMeta
+{
+    public string DeviceId { get; set; } = string.Empty;
+    public string Reason { get; set; } = string.Empty;
+    public string Stage { get; set; } = string.Empty;
+    public DateTime ExcludedAtUtc { get; set; } = DateTime.UtcNow;
+}
+
+public static class GroupControlRunExcludeReasons
+{
+    /// <summary>设备离线（MQTT 遗嘱），唯一允许回归本批次的剔除原因。</summary>
+    public const string DeviceOffline = "device_offline";
+
+    /// <summary>设备上报 agingIdle / agingStop / agingError 主动退出老化。</summary>
+    public const string AgingTerminal = "aging_terminal";
+
+    /// <summary>阶段倒计时到期仍未完成本阶段。</summary>
+    public const string StageTimeout = "stage_timeout";
+}
+
 public static class GroupControlRunStatuses
 {
     public const string Candidate = "candidate";

@@ -67,6 +67,42 @@ public static class RedisKeys
     public static string GroupControlRunExcludedDevices(string agingNumber, long runSeq)
         => $"{GroupControlRunRoot(agingNumber, runSeq)}:excluded";
 
+    /// <summary>
+    /// 每台被剔除设备的剔除上下文（原因、当时阶段、剔除时刻）。
+    /// 设备重新上报 agingStart 时据此判断是否允许回归本批次。
+    /// </summary>
+    public static string GroupControlRunExcludedMeta(string agingNumber, long runSeq)
+        => $"{GroupControlRunRoot(agingNumber, runSeq)}:excluded:meta";
+
+    // OTA 批量升级批次。批次键 = 指令 Seq + 架号，与群控 run 键风格对称：
+    // 一条 ota 指令跨多个架时会按架拆成多个批次，各自计数、各自广播重启。
+    public const string OtaRacks = $"{Prefix}:ota:racks";
+
+    /// <summary>
+    /// 某架当前活跃的 OTA 批次 Seq。用于拒绝同架并发的第二条 ota 指令。
+    /// </summary>
+    public static string OtaActiveBatch(string agingNumber)
+        => $"{Prefix}:ota:{NormalizeAgingNumber(agingNumber)}:active";
+
+    public static string OtaBatchState(string agingNumber, long seq)
+        => $"{OtaBatchRoot(agingNumber, seq)}:state";
+
+    /// <summary>已成功下发 ota 指令的设备，即"下发数量"。</summary>
+    public static string OtaBatchDispatched(string agingNumber, long seq)
+        => $"{OtaBatchRoot(agingNumber, seq)}:dispatched";
+
+    /// <summary>已上报 OTACP 下载完成的设备，即"完成数量"。Set 天然幂等。</summary>
+    public static string OtaBatchCompleted(string agingNumber, long seq)
+        => $"{OtaBatchRoot(agingNumber, seq)}:completed";
+
+    private static string OtaBatchRoot(string agingNumber, long seq)
+    {
+        if (seq <= 0)
+            throw new ArgumentOutOfRangeException(nameof(seq), "OTA 批次序号必须大于 0");
+
+        return $"{Prefix}:ota:{NormalizeAgingNumber(agingNumber)}:run:{seq}";
+    }
+
     // 原有全局设备事件流，仅用于保持上线/下线处理格式。
     public const string DeviceEventStream = $"{Prefix}:device:events";
 

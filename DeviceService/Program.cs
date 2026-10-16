@@ -35,6 +35,9 @@ builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<AgingR
 builder.Services.AddSingleton<MqttConnection>();
 builder.Services.AddSingleton<GroupControlService>();
 builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<GroupControlService>());
+builder.Services.AddSingleton<OtaUpgradeRepository>();
+builder.Services.AddSingleton<OtaUpgradeService>();
+builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<OtaUpgradeService>());
 builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<MqttConnection>());
 
 //添加托管服务

@@ -157,6 +157,62 @@ public sealed class GroupControlRepository
                 RedisKeys.GroupControlRunExcludedDevices(agingNumber, runSeq)),
             StringComparer.Ordinal);
 
+    /// <summary>
+    /// 记录设备被剔除时的上下文，供后续判断能否回归本批次。
+    /// 每次剔除都会覆盖旧记录，因此回归时限从最近一次剔除开始计算。
+    /// </summary>
+    public async Task SetRunExcludedMetaAsync(
+        string agingNumber,
+        long runSeq,
+        GroupControlRunExcludedMeta meta)
+    {
+        var key = RedisKeys.GroupControlRunExcludedMeta(agingNumber, runSeq);
+        await _redis.HashSetAsync(
+            key,
+            [new HashEntry(RedisKeys.Normalize(meta.DeviceId), JsonConvert.SerializeObject(meta))]);
+        await _redis.KeyExpireAsync(key, RunTtl);
+    }
+
+    public async Task<GroupControlRunExcludedMeta?> GetRunExcludedMetaAsync(
+        string agingNumber,
+        long runSeq,
+        string deviceId)
+    {
+        var raw = await _redis.HashGetAsync(
+            RedisKeys.GroupControlRunExcludedMeta(agingNumber, runSeq),
+            RedisKeys.Normalize(deviceId));
+
+        if (raw.IsNullOrEmpty)
+            return null;
+
+        try
+        {
+            return JsonConvert.DeserializeObject<GroupControlRunExcludedMeta>(raw.ToString());
+        }
+        catch (JsonException)
+        {
+            // 历史脏数据不影响回归判定，按无记录处理。
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 设备回归本批次：从审计剔除集合移除，并删除其剔除上下文。
+    /// </summary>
+    public async Task RemoveRunExcludedDeviceAsync(
+        string agingNumber,
+        long runSeq,
+        string deviceId)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+        await _redis.SetRemoveAsync(
+            RedisKeys.GroupControlRunExcludedDevices(agingNumber, runSeq),
+            deviceId);
+        await _redis.HashDeleteAsync(
+            RedisKeys.GroupControlRunExcludedMeta(agingNumber, runSeq),
+            deviceId);
+    }
+
     public async Task<IReadOnlySet<string>> GetRunTerminalDeviceIdsAsync(
         string agingNumber,
         long runSeq)
