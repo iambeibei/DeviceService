@@ -69,6 +69,8 @@ public sealed class RedisHelper
 
     public Task<RedisValue> HashGetAsync(string key, string field) => _db.HashGetAsync(key, field);
 
+    public Task<HashEntry[]> HashGetAllAsync(string key) => _db.HashGetAllAsync(key);
+
     public Task HashSetAsync(string key, HashEntry[] entries) => _db.HashSetAsync(key, entries);
 
     public Task<bool> HashSetIfNotExistsAsync(string key, string field, string value)

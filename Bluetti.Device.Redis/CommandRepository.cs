@@ -211,6 +211,33 @@ public sealed class CommandRepository
     }
 
     /// <summary>
+    /// 服务端主动把命令标记为 completed，用于命令已被其它服务接管、不再由命令流逐台下发的场景，
+    /// 例如多设备 ota 指令交给 OtaUpgradeService 按 Mesh 层级调度。
+    /// 与设备回复触发的 CompleteAsync 的区别：本方法不依赖设备回复。
+    /// 已处于终态（completed / failed / timed_out）的命令不会被覆盖。
+    /// </summary>
+    public async Task<CmdInfo> MarkCompletedAsync(CmdInfo command, string? message = null)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+
+        var current = await GetAsync(command.DeviceId, command.Seq) ?? command;
+        if (CommandStates.IsTerminal(current.Status))
+            return current;
+
+        current.Status = CommandStates.Completed;
+        current.CompletedAtUtc = DateTime.UtcNow;
+        current.TimedOutAtUtc = null;
+        current.ResultCode = null;
+        current.ResultMessage = message;
+        current.ReplyType = null;
+        current.ReplyJson = null;
+        await _redis.ObjectToHashAsync(current.StatusKey, current, CommandTtl);
+
+        SignalCompletion(current);
+        return current;
+    }
+
+    /// <summary>
     /// 设备在规定时间内没有返回对应 CmdSeq 时，将该命令标记为 timed_out。
     /// timed_out 是命令回复层面的终态，不做自动重发。
     /// 是否放行业务上的下一条任务由上层 Worker 决定：普通命令可继续，start_aging 仍需等待设备状态退出。

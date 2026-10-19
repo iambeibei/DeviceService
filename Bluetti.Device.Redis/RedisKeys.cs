@@ -99,13 +99,24 @@ public static class RedisKeys
     public static string OtaBatchState(string agingNumber, long seq)
         => $"{OtaBatchRoot(agingNumber, seq)}:state";
 
-    /// <summary>已成功下发 ota 指令的设备，即"下发数量"。</summary>
-    public static string OtaBatchDispatched(string agingNumber, long seq)
-        => $"{OtaBatchRoot(agingNumber, seq)}:dispatched";
+    /// <summary>
+    /// 本批升级名单与逐台状态：field=DeviceId，value=pending / upgraded / failed / skipped。
+    /// 名单即平台下发的 DeviceInfos 全集，是成功率统计的分母。
+    /// </summary>
+    public static string OtaBatchTargets(string agingNumber, long seq)
+        => $"{OtaBatchRoot(agingNumber, seq)}:targets";
 
-    /// <summary>已上报 OTACP 下载完成的设备，即"完成数量"。Set 天然幂等。</summary>
-    public static string OtaBatchCompleted(string agingNumber, long seq)
-        => $"{OtaBatchRoot(agingNumber, seq)}:completed";
+    /// <summary>名单中每台设备的 RecordId，下发 ota 指令时原样带出。</summary>
+    public static string OtaBatchRecordIds(string agingNumber, long seq)
+        => $"{OtaBatchRoot(agingNumber, seq)}:recordids";
+
+    /// <summary>该层设备升级前的固件版本号，用于升级后对比判断是否重启成功。</summary>
+    public static string OtaBatchLevelVersions(string agingNumber, long seq, int level)
+        => $"{OtaBatchLevelRoot(agingNumber, seq, level)}:versions";
+
+    /// <summary>该层已下发、等待版本号变化确认的设备。移空即本层完成。</summary>
+    public static string OtaBatchLevelPending(string agingNumber, long seq, int level)
+        => $"{OtaBatchLevelRoot(agingNumber, seq, level)}:pending";
 
     private static string OtaBatchRoot(string agingNumber, long seq)
     {
@@ -113,6 +124,14 @@ public static class RedisKeys
             throw new ArgumentOutOfRangeException(nameof(seq), "OTA 批次序号必须大于 0");
 
         return $"{Prefix}:ota:{NormalizeAgingNumber(agingNumber)}:run:{seq}";
+    }
+
+    private static string OtaBatchLevelRoot(string agingNumber, long seq, int level)
+    {
+        if (level <= 0)
+            throw new ArgumentOutOfRangeException(nameof(level), "Mesh 层级必须从 1 开始");
+
+        return $"{OtaBatchRoot(agingNumber, seq)}:level:{level}";
     }
 
     // 原有全局设备事件流，仅用于保持上线/下线处理格式。

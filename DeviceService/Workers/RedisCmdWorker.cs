@@ -204,6 +204,16 @@ public sealed class RedisCmdWorker : BackgroundService
                 ct);
         }
 
+        // 多设备 ota 交给 OtaUpgradeService 按 Mesh 层级调度：
+        // 分层升级要等上一层重启确认后才下发下一层，耗时远超单条命令的回复窗口，
+        // 不能走命令流逐台分发。单设备 ota 没有 mesh 依赖，仍按普通命令直接转发。
+        var otaCommands = commands.Where(command => IsOta(command.Action)).ToArray();
+        if (_otaUpgrade.Enabled && otaCommands.Length > 1)
+        {
+            await TakeOverOtaBatchAsync(messageId, otaCommands, commands, ct);
+            return;
+        }
+
         var batch = new BatchAckTracker(messageId, commands.Count);
 
         _logger.LogInformation(
@@ -220,6 +230,58 @@ public sealed class RedisCmdWorker : BackgroundService
     }
 
     /// <summary>
+    /// 多设备 ota 指令的接管：交给 OtaUpgradeService 分层调度，
+    /// 命令流侧把整条指令的命令项一次性结束，避免 Stream Entry 长时间挂着不 ACK。
+    /// 真实进度查 lgw:ota:{架}:run:{Seq}:state。
+    /// </summary>
+    private async Task TakeOverOtaBatchAsync(
+        RedisValue messageId,
+        IReadOnlyList<CmdInfo> otaCommands,
+        IReadOnlyList<CmdInfo> allCommands,
+        CancellationToken ct)
+    {
+        var batch = new BatchAckTracker(messageId, allCommands.Count);
+        var decision = await _otaUpgrade.TryTakeOverAsync(otaCommands);
+
+        foreach (var command in allCommands)
+        {
+            var deviceId = RedisKeys.Normalize(command.DeviceId);
+
+            if (decision.Accepted)
+            {
+                await _commands.MarkCompletedAsync(
+                    command,
+                    $"已由 OTA 分层升级服务接管，AgingNumber={decision.AgingNumber}，进度见 lgw:ota:{decision.AgingNumber}:run:{command.Seq}:state");
+            }
+            else
+            {
+                await _commands.MarkFailedAsync(command, decision.Reason);
+            }
+
+            await CompleteBatchItemAsync(batch, deviceId, command.Seq);
+        }
+
+        if (decision.Accepted)
+        {
+            _logger.LogWarning(
+                "多设备 ota 指令已交由分层升级服务接管，Seq={Seq}, DeviceCount={DeviceCount}, AgingNumber={AgingNumber}, StreamId={StreamId}",
+                otaCommands[0].Seq,
+                otaCommands.Count,
+                decision.AgingNumber,
+                messageId);
+        }
+        else
+        {
+            _logger.LogWarning(
+                "多设备 ota 指令接管失败，Seq={Seq}, DeviceCount={DeviceCount}, Reason={Reason}, StreamId={StreamId}",
+                otaCommands[0].Seq,
+                otaCommands.Count,
+                decision.Reason,
+                messageId);
+        }
+    }
+
+    /// <summary>
     /// 根据 DeviceId 将拆分后的单设备命令投递到原有设备队列。
     /// start_aging 在创建老化专用队列（及其 AgingCommandGate 发送门）之前，
     /// 先通过 lgw:devices:online 检查设备是否在线；离线则不创建门控并直接结束该命令。
@@ -230,45 +292,6 @@ public sealed class RedisCmdWorker : BackgroundService
         command.DeviceId = deviceId;
 
         var isStartAging = IsStartAging(command.Action);
-        var isOta = IsOta(command.Action);
-
-        // ota 指令同样先查在线：离线设备收不到指令，也不会上报 OTACP，
-        // 若计入批次下发数，批次永远凑不齐，只能干等超时兜底。
-        if (isOta && !await _devices.IsDeviceOnlineAsync(deviceId))
-        {
-            _logger.LogWarning(
-                "ota 目标设备不在线，拒绝下发，DeviceId={DeviceId}, Seq={Seq}, StreamId={StreamId}",
-                deviceId,
-                command.Seq,
-                batch.MessageId);
-
-            await _commands.MarkFailedAsync(
-                command,
-                "设备不在线（未出现在 lgw:devices:online），拒绝下发 ota 指令");
-
-            await CompleteBatchItemAsync(batch, deviceId, command.Seq);
-            return;
-        }
-
-        if (isOta)
-        {
-            // 同架已有未完成 OTA 批次、或设备没有架号时拒绝下发，避免两批互相打断。
-            var decision = await _otaUpgrade.BeginDispatchAsync(deviceId, command.Seq);
-            if (!decision.Allowed)
-            {
-                _logger.LogWarning(
-                    "ota 指令未通过批次准入，DeviceId={DeviceId}, Seq={Seq}, AgingNumber={AgingNumber}, Reason={Reason}, StreamId={StreamId}",
-                    deviceId,
-                    command.Seq,
-                    decision.AgingNumber,
-                    decision.Reason,
-                    batch.MessageId);
-
-                await _commands.MarkFailedAsync(command, decision.Reason);
-                await CompleteBatchItemAsync(batch, deviceId, command.Seq);
-                return;
-            }
-        }
 
         if (isStartAging && !await _devices.IsDeviceOnlineAsync(deviceId))
         {
@@ -504,19 +527,7 @@ public sealed class RedisCmdWorker : BackgroundService
             {
                 try
                 {
-                    _ = await ProcessOneCommandAsync(
-                        deviceId,
-                        item,
-                        ct,
-                        onPublished: async () =>
-                        {
-                            // ota 指令真正发布成功才计入批次下发数，
-                            // 批次据此判断"下发数量"并在全部完成后广播重启。
-                            if (IsOta(item.Command.Action))
-                                await _otaUpgrade.RecordDispatchAsync(
-                                    deviceId,
-                                    item.Command.Seq);
-                        });
+                    _ = await ProcessOneCommandAsync(deviceId, item, ct);
                     break;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)

@@ -1,10 +1,12 @@
 using Bluetti.Device.Redis.Models;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using StackExchange.Redis;
 
 namespace Bluetti.Device.Redis;
 
 /// <summary>
-/// OTA 批量升级批次仓储。批次按老化架隔离，批次号直接复用 ota 指令 Seq。
+/// OTA 分层升级批次仓储。批次按老化架隔离，批次号直接复用 ota 指令 Seq。
 /// </summary>
 public sealed class OtaUpgradeRepository
 {
@@ -35,9 +37,6 @@ public sealed class OtaUpgradeRepository
             RedisTtl.OtaBatch);
     }
 
-    /// <summary>
-    /// 读取某架当前活跃批次号；没有活跃批次返回 null。
-    /// </summary>
     public async Task<long?> GetActiveBatchSeqAsync(string agingNumber)
     {
         var raw = await _redis.StringGetAsync(RedisKeys.OtaActiveBatch(agingNumber));
@@ -55,29 +54,171 @@ public sealed class OtaUpgradeRepository
     public Task<bool> ClearActiveBatchAsync(string agingNumber)
         => _redis.KeyDeleteAsync(RedisKeys.OtaActiveBatch(agingNumber));
 
-    public async Task AddDispatchedAsync(string agingNumber, long seq, string deviceId)
+    /// <summary>
+    /// 初始化升级名单。名单是平台 DeviceInfos 全集，也是成功率统计的分母。
+    /// </summary>
+    public async Task SetTargetsAsync(
+        string agingNumber,
+        long seq,
+        IEnumerable<string> deviceIds,
+        string status)
     {
-        var key = RedisKeys.OtaBatchDispatched(agingNumber, seq);
+        var entries = deviceIds
+            .Select(RedisKeys.Normalize)
+            .Distinct(StringComparer.Ordinal)
+            .Select(deviceId => new HashEntry(deviceId, status))
+            .ToArray();
+
+        if (entries.Length == 0)
+            return;
+
+        var key = RedisKeys.OtaBatchTargets(agingNumber, seq);
+        await _redis.HashSetAsync(key, entries);
+        await _redis.KeyExpireAsync(key, RedisTtl.OtaBatch);
+    }
+
+    public async Task SetTargetStatusAsync(
+        string agingNumber,
+        long seq,
+        string deviceId,
+        string status)
+    {
+        var key = RedisKeys.OtaBatchTargets(agingNumber, seq);
+        await _redis.HashSetAsync(
+            key,
+            [new HashEntry(RedisKeys.Normalize(deviceId), status)]);
+        await _redis.KeyExpireAsync(key, RedisTtl.OtaBatch);
+    }
+
+    public async Task<Dictionary<string, string>> GetTargetsAsync(string agingNumber, long seq)
+    {
+        var members = await _redis.HashGetAllAsync(RedisKeys.OtaBatchTargets(agingNumber, seq));
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var member in members)
+        {
+            var id = member.Name.ToString();
+            if (!string.IsNullOrWhiteSpace(id))
+                result[id] = member.Value.ToString();
+        }
+
+        return result;
+    }
+
+    /// <summary>保存名单中每台设备的 RecordId 与指令 Data，下发 ota 时原样带出。</summary>
+    public async Task SetRecordIdAsync(
+        string agingNumber,
+        long seq,
+        string deviceId,
+        string recordId)
+    {
+        var key = RedisKeys.OtaBatchRecordIds(agingNumber, seq);
+        await _redis.HashSetAsync(
+            key,
+            [new HashEntry(RedisKeys.Normalize(deviceId), recordId)]);
+        await _redis.KeyExpireAsync(key, RedisTtl.OtaBatch);
+    }
+
+    public async Task<string?> GetRecordIdAsync(string agingNumber, long seq, string deviceId)
+    {
+        var raw = await _redis.HashGetAsync(
+            RedisKeys.OtaBatchRecordIds(agingNumber, seq),
+            RedisKeys.Normalize(deviceId));
+
+        return raw.IsNullOrEmpty ? null : raw.ToString();
+    }
+
+    /// <summary>记录某台设备在本层升级前的固件版本号，供升级后对比判断是否重启成功。</summary>
+    public async Task SetLevelVersionAsync(
+        string agingNumber,
+        long seq,
+        int level,
+        string deviceId,
+        string version)
+    {
+        var key = RedisKeys.OtaBatchLevelVersions(agingNumber, seq, level);
+        await _redis.HashSetAsync(
+            key,
+            [new HashEntry(RedisKeys.Normalize(deviceId), version)]);
+        await _redis.KeyExpireAsync(key, RedisTtl.OtaBatch);
+    }
+
+    public async Task<string?> GetLevelVersionAsync(
+        string agingNumber,
+        long seq,
+        int level,
+        string deviceId)
+    {
+        var raw = await _redis.HashGetAsync(
+            RedisKeys.OtaBatchLevelVersions(agingNumber, seq, level),
+            RedisKeys.Normalize(deviceId));
+
+        return raw.IsNullOrEmpty ? null : raw.ToString();
+    }
+
+    public async Task AddLevelPendingAsync(
+        string agingNumber,
+        long seq,
+        int level,
+        string deviceId)
+    {
+        var key = RedisKeys.OtaBatchLevelPending(agingNumber, seq, level);
         await _redis.SetAddAsync(key, RedisKeys.Normalize(deviceId));
         await _redis.KeyExpireAsync(key, RedisTtl.OtaBatch);
     }
 
-    public async Task<IReadOnlySet<string>> GetDispatchedAsync(string agingNumber, long seq)
+    public Task<bool> RemoveLevelPendingAsync(
+        string agingNumber,
+        long seq,
+        int level,
+        string deviceId)
+        => _redis.SetRemoveAsync(
+            RedisKeys.OtaBatchLevelPending(agingNumber, seq, level),
+            RedisKeys.Normalize(deviceId));
+
+    public async Task<IReadOnlySet<string>> GetLevelPendingAsync(
+        string agingNumber,
+        long seq,
+        int level)
         => new HashSet<string>(
-            await _redis.SetMembersAsync(RedisKeys.OtaBatchDispatched(agingNumber, seq)),
+            await _redis.SetMembersAsync(
+                RedisKeys.OtaBatchLevelPending(agingNumber, seq, level)),
             StringComparer.Ordinal);
 
-    public async Task AddCompletedAsync(string agingNumber, long seq, string deviceId)
+    public Task<bool> ClearLevelPendingAsync(string agingNumber, long seq, int level)
+        => _redis.KeyDeleteAsync(RedisKeys.OtaBatchLevelPending(agingNumber, seq, level));
+
+    /// <summary>
+    /// 读取某架某 Mesh 层级的设备清单 lgw:ota:{AgingNumber}:{MeshLevel}，
+    /// 元素与其它在线列表同构：{"id":"...","type":"...","AgingNumber":"88","MeshLevel":1}
+    /// </summary>
+    public async Task<IReadOnlySet<string>> GetMeshLevelDeviceIdsAsync(
+        string agingNumber,
+        int level)
     {
-        var key = RedisKeys.OtaBatchCompleted(agingNumber, seq);
-        await _redis.SetAddAsync(key, RedisKeys.Normalize(deviceId));
-        await _redis.KeyExpireAsync(key, RedisTtl.OtaBatch);
-    }
+        var items = await _redis.ListRangeAsync(
+            RedisKeys.OtaMeshLevelDevices(agingNumber, level));
 
-    public async Task<IReadOnlySet<string>> GetCompletedAsync(string agingNumber, long seq)
-        => new HashSet<string>(
-            await _redis.SetMembersAsync(RedisKeys.OtaBatchCompleted(agingNumber, seq)),
-            StringComparer.Ordinal);
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in items)
+        {
+            if (string.IsNullOrWhiteSpace(item))
+                continue;
+
+            try
+            {
+                var json = JObject.Parse(item);
+                var id = json.GetValue("id", StringComparison.OrdinalIgnoreCase)?.Value<string>();
+                if (!string.IsNullOrWhiteSpace(id))
+                    result.Add(RedisKeys.Normalize(id));
+            }
+            catch (JsonException)
+            {
+                // 非法历史元素不参与升级名单匹配。
+            }
+        }
+
+        return result;
+    }
 
     /// <summary>
     /// 群控 / OTA 直接下发的指令共用同一个全局递增序列，保证 Seq 不会与命令流冲突。

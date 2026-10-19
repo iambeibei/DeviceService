@@ -664,6 +664,21 @@ public sealed class DeviceRepository
         return false;
     }
 
+    /// <summary>
+    /// 读取设备上报的固件版本号（runtime 的 FirewareVersion 字段，沿用项目既有拼写）。
+    /// 注意：DeviceNode 模型没有该字段，用 GetAsync 反序列化读不出来，必须按字段单独取。
+    /// OTA 分层升级靠它判断设备是否真的升级重启成功。
+    /// </summary>
+    public async Task<string?> GetFirmwareVersionAsync(string deviceId)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+        var raw = await _redis.HashGetAsync(
+            RedisKeys.DeviceRuntime(deviceId),
+            "FirewareVersion");
+
+        return raw.IsNullOrEmpty ? null : raw.ToString();
+    }
+
     public Task<string[]> GetAgingRackOnlineDeviceJsonListAsync(string agingNumber)
         => _redis.ListRangeAsync(
             RedisKeys.AgingRackOnlineDeviceList(agingNumber),
