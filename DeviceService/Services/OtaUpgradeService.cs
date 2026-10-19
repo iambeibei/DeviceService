@@ -52,7 +52,7 @@ public sealed class OtaUpgradeService : BackgroundService
         _enabled = configuration.GetValue<bool?>("OtaUpgrade:Enabled") ?? true;
 
         var timeoutMinutes = configuration.GetValue<double?>(
-            "OtaUpgrade:CompletionTimeoutMinutes") ?? 10;
+            "OtaUpgrade:CompletionTimeoutMinutes") ?? 30;
         if (timeoutMinutes <= 0)
             throw new InvalidOperationException(
                 "OtaUpgrade:CompletionTimeoutMinutes 必须大于 0");
