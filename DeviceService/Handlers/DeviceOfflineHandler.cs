@@ -66,6 +66,27 @@ public sealed class DeviceOfflineHandler : IMqttMessageHandler
                 seq,
                 payload);
 
+            // 从「架 + Mesh 层级」清单移除，避免 OTA 分层清单里残留已离线节点。
+            if (previous?.MeshLevel is not null &&
+                !string.IsNullOrWhiteSpace(previous.AgingNumber))
+            {
+                try
+                {
+                    await _devices.RemoveOtaMeshLevelAsync(
+                        deviceId,
+                        RedisKeys.NormalizeAgingNumber(previous.AgingNumber),
+                        previous.MeshLevel.Value);
+                }
+                catch (ArgumentException ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "架号非法，跳过 OTA 分层清单清理，DeviceId={DeviceId}, AgingNumber={AgingNumber}",
+                        deviceId,
+                        previous.AgingNumber);
+                }
+            }
+
             // 先剔除屏障成员，再重估该架：
             // 掉线设备不再上报阶段完成，若不移出 participants 会永久阻塞整架放行。
             await _groupControl.HandleDeviceOfflineAsync(deviceId);

@@ -10,6 +10,12 @@ public sealed class DeviceNode
     public bool Online { get; set; }
     public string? DeviceType { get; set; }
     public string? AgingNumber { get; set; }
+
+    /// <summary>
+    /// 设备上报的 Mesh 层级。用于维护 lgw:ota:{AgingNumber}:{MeshLevel} 分组清单，
+    /// 换架或换层级时能定位旧分组把条目清掉；为空表示设备未上报过该字段。
+    /// </summary>
+    public long? MeshLevel { get; set; }
     public DateTime? FirstSeenUtc { get; set; }
     public DateTime? LastSeenUtc { get; set; }
     public string? LastSource { get; set; }

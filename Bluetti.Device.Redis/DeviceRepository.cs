@@ -32,7 +32,8 @@ public sealed class DeviceRepository
         string deviceId,
         string deviceType,
         string? agingNumber,
-        long? messageSeq = null)
+        long? messageSeq = null,
+        long? meshLevel = null)
     {
         deviceId = RedisKeys.Normalize(deviceId);
         deviceType = deviceType.Trim();
@@ -85,8 +86,54 @@ public sealed class DeviceRepository
             RedisKeys.DeviceRuntime(deviceId),
             [
                 new HashEntry("DeviceType", deviceType),
-                new HashEntry("AgingNumber", agingNumber ?? string.Empty)
+                new HashEntry("AgingNumber", agingNumber ?? string.Empty),
+                new HashEntry("MeshLevel", meshLevel?.ToString() ?? string.Empty)
             ]);
+    }
+
+    /// <summary>
+    /// 设备上线时把它写入「架 + Mesh 层级」清单 lgw:ota:{AgingNumber}:{MeshLevel}，供 OTA 分层升级取用。
+    /// 与在线列表同构、同样先移除该设备的旧元素再追加：设备重复上线不会留下重复条目，
+    /// 换架或换层级时旧条目也会被顶掉。
+    /// 注意：该清单目前只在上/下线时维护，不设过期；
+    /// 若设备离线后不移除，清单里会保留已离线节点，取用方需自行判断在线状态。
+    /// </summary>
+    public async Task SaveOtaMeshLevelAsync(
+        string deviceId,
+        string deviceType,
+        string agingNumber,
+        long meshLevel)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+        agingNumber = RedisKeys.NormalizeAgingNumber(agingNumber);
+
+        var key = RedisKeys.OtaMeshLevelDevices(agingNumber, meshLevel);
+        var meshJson = JsonConvert.SerializeObject(new
+        {
+            id = deviceId,
+            type = deviceType.Trim(),
+            AgingNumber = agingNumber,
+            MeshLevel = meshLevel
+        });
+
+        await RemoveDeviceFromOnlineListAsync(key, deviceId);
+        await _redis.ListRightPushAsync(key, meshJson);
+    }
+
+    /// <summary>
+    /// 设备离线时从「架 + Mesh 层级」清单移除，避免清单里残留已离线节点。
+    /// </summary>
+    public async Task<bool> RemoveOtaMeshLevelAsync(
+        string deviceId,
+        string agingNumber,
+        long meshLevel)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+        agingNumber = RedisKeys.NormalizeAgingNumber(agingNumber);
+
+        return await RemoveDeviceFromOnlineListAsync(
+            RedisKeys.OtaMeshLevelDevices(agingNumber, meshLevel),
+            deviceId);
     }
 
     public async Task VersionSaveToRuntime(string deviceId,string version)

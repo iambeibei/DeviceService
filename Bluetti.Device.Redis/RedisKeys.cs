@@ -79,6 +79,18 @@ public static class RedisKeys
     public const string OtaRacks = $"{Prefix}:ota:racks";
 
     /// <summary>
+    /// 按「老化架 + Mesh 层级」分组的设备清单，供 OTA 分层升级取用：lgw:ota:{AgingNumber}:{MeshLevel}。
+    /// 元素与其它在线列表同构：{"id":"100000016","type":"2","AgingNumber":"88","MeshLevel":1}
+    /// </summary>
+    public static string OtaMeshLevelDevices(string agingNumber, long meshLevel)
+    {
+        if (meshLevel < 0)
+            throw new ArgumentOutOfRangeException(nameof(meshLevel), "Mesh 层级不能为负数");
+
+        return $"{Prefix}:ota:{NormalizeAgingNumber(agingNumber)}:{meshLevel}";
+    }
+
+    /// <summary>
     /// 某架当前活跃的 OTA 批次 Seq。用于拒绝同架并发的第二条 ota 指令。
     /// </summary>
     public static string OtaActiveBatch(string agingNumber)
