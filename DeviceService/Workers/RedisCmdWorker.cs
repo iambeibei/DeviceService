@@ -35,6 +35,7 @@ public sealed class RedisCmdWorker : BackgroundService
     private readonly string _consumerName;
     private readonly TimeSpan _replyTimeout;
     private readonly TimeSpan _publishRetryDelay;
+    private readonly TimeSpan _startAgingStagger;
 
     private readonly ConcurrentDictionary<string, DeviceCommandQueue> _deviceQueues =
         new(StringComparer.Ordinal);
@@ -72,6 +73,15 @@ public sealed class RedisCmdWorker : BackgroundService
         if (retryDelayMilliseconds <= 0)
             throw new InvalidOperationException("CommandProcessing:PublishRetryDelayMilliseconds 必须大于 0");
         _publishRetryDelay = TimeSpan.FromMilliseconds(retryDelayMilliseconds);
+
+        // 批量 start_aging 的错峰间隔。默认 0 表示不间隔（各设备并行下发）。
+        // 注意：该延迟施加在 Stream 消费主循环里，会阻塞新命令读取 N×间隔毫秒。
+        var staggerMilliseconds = configuration.GetValue<int?>(
+            "CommandProcessing:StartAgingStaggerMilliseconds") ?? 0;
+        if (staggerMilliseconds < 0)
+            throw new InvalidOperationException(
+                "CommandProcessing:StartAgingStaggerMilliseconds 不能为负数");
+        _startAgingStagger = TimeSpan.FromMilliseconds(staggerMilliseconds);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -222,10 +232,20 @@ public sealed class RedisCmdWorker : BackgroundService
             commands.Count,
             messageId);
 
-        foreach (var command in commands)
+        for (var index = 0; index < commands.Count; index++)
         {
             ct.ThrowIfCancellationRequested();
-            await DispatchAsync(batch, command, ct);
+            await DispatchAsync(batch, commands[index], ct);
+
+            // 各设备的命令队列是独立的、并行消费的，入队即意味着马上开始发布。
+            // 批量 start_aging 这里按顺序间隔入队，避免整架设备在同一瞬间启动。
+            // 最后一台后面不再等待，避免给批次尾巴白白加上一段延迟。
+            if (_startAgingStagger > TimeSpan.Zero &&
+                IsStartAging(commands[index].Action) &&
+                index < commands.Count - 1)
+            {
+                await Task.Delay(_startAgingStagger, ct);
+            }
         }
     }
 

@@ -36,6 +36,7 @@ public sealed class OtaUpgradeService : BackgroundService
     private readonly bool _rejectConcurrentBatch;
     private readonly bool _raiseFaultOnIncomplete;
     private readonly bool _abortOnLevelTimeout;
+    private readonly bool _abortOnFirstLevelFailure;
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _rackLocks =
         new(StringComparer.Ordinal);
@@ -93,6 +94,11 @@ public sealed class OtaUpgradeService : BackgroundService
 
         _abortOnLevelTimeout = configuration.GetValue<bool?>(
             "OtaUpgrade:AbortOnLevelTimeout") ?? false;
+
+        // 根节点（MeshLevel 1）是整条 mesh 的入口：它没起来，后面各层即使下发也收不到包。
+        // 因此首层任一节点升级失败就直接结束整批，不再逐层空等超时。
+        _abortOnFirstLevelFailure = configuration.GetValue<bool?>(
+            "OtaUpgrade:AbortOnFirstLevelFailure") ?? true;
     }
 
     /// <summary>是否接管多设备 ota 指令。关闭时所有 ota 都按普通命令直接转发。</summary>
@@ -172,13 +178,14 @@ public sealed class OtaUpgradeService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
-            "OTA 分层升级协调服务已启动，Enabled={Enabled}, BaseTimeoutMinutes={BaseTimeoutMinutes}, TimeoutIncrementMinutes={TimeoutIncrementMinutes}, LevelStabilizeSeconds={LevelStabilizeSeconds}, MaxMeshLevel={MaxMeshLevel}, AbortOnLevelTimeout={AbortOnLevelTimeout}",
+            "OTA 分层升级协调服务已启动，Enabled={Enabled}, BaseTimeoutMinutes={BaseTimeoutMinutes}, TimeoutIncrementMinutes={TimeoutIncrementMinutes}, LevelStabilizeSeconds={LevelStabilizeSeconds}, MaxMeshLevel={MaxMeshLevel}, AbortOnLevelTimeout={AbortOnLevelTimeout}, AbortOnFirstLevelFailure={AbortOnFirstLevelFailure}",
             _enabled,
             _baseTimeout.TotalMinutes,
             _timeoutIncrement.TotalMinutes,
             _levelStabilize.TotalSeconds,
             _maxMeshLevel,
-            _abortOnLevelTimeout);
+            _abortOnLevelTimeout,
+            _abortOnFirstLevelFailure);
 
         if (!_enabled)
             return;
@@ -463,6 +470,21 @@ public sealed class OtaUpgradeService : BackgroundService
         }
 
         await _repository.ClearLevelPendingAsync(agingNumber, state.Seq, level);
+
+        // 首层门禁：第 1 层（根节点）没升起来，后续层再下发也没意义，直接收尾整批。
+        // 只认"已下发但未确认"的超时失败；空层快跳（candidates 为 0）走的是
+        // StartLevelAsync → AdvanceLevelAsync，不经过这里，不会被误判成失败。
+        if (_abortOnFirstLevelFailure && level == 1)
+        {
+            _logger.LogWarning(
+                "OTA 首层节点升级失败，中止整个批次，后续层不再下发，AgingNumber={AgingNumber}, Seq={Seq}, Failed={FailedCount}",
+                agingNumber,
+                state.Seq,
+                pending.Count);
+
+            await FinishBatchAsync(agingNumber, state, "首层节点升级失败，中止整批");
+            return;
+        }
 
         if (_abortOnLevelTimeout)
         {
