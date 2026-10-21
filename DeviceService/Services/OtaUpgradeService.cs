@@ -30,13 +30,13 @@ public sealed class OtaUpgradeService : BackgroundService
     private readonly bool _enabled;
     private readonly TimeSpan _baseTimeout;
     private readonly TimeSpan _timeoutIncrement;
+    private readonly TimeSpan? _maxLevelTimeout;
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan _levelStabilize;
     private readonly int _maxMeshLevel;
     private readonly bool _rejectConcurrentBatch;
     private readonly bool _raiseFaultOnIncomplete;
     private readonly bool _abortOnLevelTimeout;
-    private readonly bool _abortOnFirstLevelFailure;
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _rackLocks =
         new(StringComparer.Ordinal);
@@ -69,6 +69,16 @@ public sealed class OtaUpgradeService : BackgroundService
             ? TimeSpan.FromMinutes(incrementMinutes)
             : TimeSpan.Zero;
 
+        // 单层超时的上限：层数越深等待越久，但不能无上限增长。
+        // 配成与"第 2 层的理论值"相同即可得到"第 1 层一个值、之后各层固定值"的效果，
+        // 例如 Base=5 / Increment=10 / Max=10 → L1=5、L2 起一律 10。
+        // 缺省或 ≤0 表示不设上限。
+        var maxLevelMinutes = configuration.GetValue<double?>(
+            "OtaUpgrade:MaxLevelTimeoutMinutes") ?? 0;
+        _maxLevelTimeout = maxLevelMinutes > 0
+            ? TimeSpan.FromMinutes(maxLevelMinutes)
+            : null;
+
         var pollMilliseconds = configuration.GetValue<int?>(
             "OtaUpgrade:PollIntervalMilliseconds") ?? 1000;
         if (pollMilliseconds <= 0)
@@ -94,11 +104,6 @@ public sealed class OtaUpgradeService : BackgroundService
 
         _abortOnLevelTimeout = configuration.GetValue<bool?>(
             "OtaUpgrade:AbortOnLevelTimeout") ?? false;
-
-        // 根节点（MeshLevel 1）是整条 mesh 的入口：它没起来，后面各层即使下发也收不到包。
-        // 因此首层任一节点升级失败就直接结束整批，不再逐层空等超时。
-        _abortOnFirstLevelFailure = configuration.GetValue<bool?>(
-            "OtaUpgrade:AbortOnFirstLevelFailure") ?? true;
     }
 
     /// <summary>是否接管多设备 ota 指令。关闭时所有 ota 都按普通命令直接转发。</summary>
@@ -178,14 +183,14 @@ public sealed class OtaUpgradeService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
-            "OTA 分层升级协调服务已启动，Enabled={Enabled}, BaseTimeoutMinutes={BaseTimeoutMinutes}, TimeoutIncrementMinutes={TimeoutIncrementMinutes}, LevelStabilizeSeconds={LevelStabilizeSeconds}, MaxMeshLevel={MaxMeshLevel}, AbortOnLevelTimeout={AbortOnLevelTimeout}, AbortOnFirstLevelFailure={AbortOnFirstLevelFailure}",
+            "OTA 分层升级协调服务已启动，Enabled={Enabled}, BaseTimeoutMinutes={BaseTimeoutMinutes}, TimeoutIncrementMinutes={TimeoutIncrementMinutes}, MaxLevelTimeoutMinutes={MaxLevelTimeoutMinutes}, LevelStabilizeSeconds={LevelStabilizeSeconds}, MaxMeshLevel={MaxMeshLevel}, AbortOnLevelTimeout={AbortOnLevelTimeout}",
             _enabled,
             _baseTimeout.TotalMinutes,
             _timeoutIncrement.TotalMinutes,
+            _maxLevelTimeout?.TotalMinutes,
             _levelStabilize.TotalSeconds,
             _maxMeshLevel,
-            _abortOnLevelTimeout,
-            _abortOnFirstLevelFailure);
+            _abortOnLevelTimeout);
 
         if (!_enabled)
             return;
@@ -241,14 +246,6 @@ public sealed class OtaUpgradeService : BackgroundService
                 return;
             }
 
-            // 层间 mesh 稳定等待：上一层重启会让下层设备短暂掉线，
-            // 等设备重新回到分层清单后再取下一层交集，否则会被误判成不在名单里。
-            if (state.StabilizeUntilUtc.HasValue &&
-                DateTime.UtcNow < state.StabilizeUntilUtc.Value)
-            {
-                return;
-            }
-
             switch (state.LevelStatus)
             {
                 case OtaLevelStatuses.Pending:
@@ -256,6 +253,12 @@ public sealed class OtaUpgradeService : BackgroundService
                     break;
                 case OtaLevelStatuses.Upgrading:
                     await VerifyLevelAsync(agingNumber, state);
+                    break;
+                case OtaLevelStatuses.Stabilizing:
+                    await VerifyStabilizeAsync(agingNumber, state);
+                    break;
+                case OtaLevelStatuses.Finalizing:
+                    await FinalizeDispatchAsync(agingNumber, state, cancellationToken);
                     break;
                 default:
                     await AdvanceLevelAsync(agingNumber, state);
@@ -278,11 +281,18 @@ public sealed class OtaUpgradeService : BackgroundService
     {
         if (state.CurrentLevel > _maxMeshLevel)
         {
-            await FinishBatchAsync(agingNumber, state, "已达到 Mesh 层级上限");
+            state.LevelStatus = OtaLevelStatuses.Finalizing;
+            state.StabilizeUntilUtc = null;
+            await _repository.SaveBatchStateAsync(agingNumber, state);
             return;
         }
 
         var level = state.CurrentLevel;
+
+        // dispatched 只记录当前层：上一层的记录在这里清掉，
+        // 本层完成判定只比对 targets 里本层这批设备的最新状态。
+        await _repository.ClearDispatchedAsync(agingNumber, state.Seq);
+
         var levelDevices = await _repository.GetMeshLevelDeviceIdsAsync(agingNumber, level);
         var targets = await _repository.GetTargetsAsync(agingNumber, state.Seq);
         var candidates = targets
@@ -291,6 +301,21 @@ public sealed class OtaUpgradeService : BackgroundService
             .Where(levelDevices.Contains)
             .OrderBy(deviceId => deviceId, StringComparer.Ordinal)
             .ToArray();
+
+        // 首次真正下发时记录按架在线列表的个数，作为后续 mesh 稳定判定的基准。
+        // 必须在设备开始重启前读，读晚了个数已经掉下去了。
+        if (state.ExpectedOnlineCount is null && candidates.Length > 0)
+        {
+            state.ExpectedOnlineCount =
+                (int)await _devices.GetOtaRackOnlineCountAsync(agingNumber);
+
+            _logger.LogInformation(
+                "OTA 记录 mesh 稳定基准在线数，AgingNumber={AgingNumber}, Seq={Seq}, Level={Level}, ExpectedOnlineCount={ExpectedOnlineCount}",
+                agingNumber,
+                state.Seq,
+                level,
+                state.ExpectedOnlineCount.Value);
+        }
 
         var dispatched = new List<string>();
         foreach (var deviceId in candidates)
@@ -335,7 +360,8 @@ public sealed class OtaUpgradeService : BackgroundService
                     BuildOtaPayload(state, recordId),
                     cancellationToken);
 
-                await _repository.AddLevelPendingAsync(agingNumber, state.Seq, level, deviceId);
+                await _repository.AddDispatchedAsync(agingNumber, state.Seq, deviceId);
+                await _repository.AddDispatchedAllAsync(agingNumber, state.Seq, deviceId);
                 dispatched.Add(deviceId);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -401,14 +427,24 @@ public sealed class OtaUpgradeService : BackgroundService
     }
 
     /// <summary>
-    /// 等待本层各设备版本号变化。全部确认即本层完成；超时按配置跳过或中止。
+    /// 等待本层各设备版本号变化。
+    /// 完成判据是「本层 dispatched 里的设备在 targets 中全部是 upgraded」，
+    /// 而不是「本层的确认记录清空」——后者会被 mesh 层级漂移卡死：
+    /// 设备在低层下发后若跑到更高层被重新下发并升级成功，
+    /// 低层的确认记录永远不会清，只能靠超时推进。
+    /// 比对 targets 的最新状态就没有这个问题。
     /// </summary>
     private async Task VerifyLevelAsync(string agingNumber, OtaBatchState state)
     {
         var level = state.CurrentLevel;
-        var pending = await _repository.GetLevelPendingAsync(agingNumber, state.Seq, level);
+        var dispatched = await _repository.GetDispatchedAsync(agingNumber, state.Seq);
 
-        foreach (var deviceId in pending.OrderBy(x => x, StringComparer.Ordinal).ToArray())
+        // 只对本层下发过、但 targets 里还没升级成功的设备比对版本号。
+        var targets = await _repository.GetTargetsAsync(agingNumber, state.Seq);
+        foreach (var deviceId in dispatched
+            .Where(id => !IsUpgraded(targets, id))
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .ToArray())
         {
             var current = await _devices.GetFirmwareVersionAsync(deviceId);
             var old = await _repository.GetLevelVersionAsync(
@@ -420,7 +456,6 @@ public sealed class OtaUpgradeService : BackgroundService
             if (!VersionChanged(old, current))
                 continue;
 
-            await _repository.RemoveLevelPendingAsync(agingNumber, state.Seq, level, deviceId);
             await _repository.SetTargetStatusAsync(
                 agingNumber,
                 state.Seq,
@@ -437,53 +472,38 @@ public sealed class OtaUpgradeService : BackgroundService
                 current ?? "<empty>");
         }
 
-        pending = await _repository.GetLevelPendingAsync(agingNumber, state.Seq, level);
-        if (pending.Count == 0)
+        // 上面刚写过状态，这里必须重读一次 targets 再判定。
+        targets = await _repository.GetTargetsAsync(agingNumber, state.Seq);
+        var unfinished = dispatched
+            .Where(id => !IsUpgraded(targets, id))
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .ToArray();
+
+        if (unfinished.Length == 0)
         {
-            await CompleteLevelAsync(agingNumber, state, "本层设备均已确认升级");
+            await CompleteLevelAsync(agingNumber, state, "本层下发设备均已升级完成");
             return;
         }
 
         if (!state.LevelDeadlineUtc.HasValue || DateTime.UtcNow < state.LevelDeadlineUtc.Value)
             return;
 
-        var message =
-            $"OTA 第 {level} 层等待超时，设备未完成升级，AgingNumber={agingNumber}, Seq={state.Seq}";
-
-        foreach (var deviceId in pending.OrderBy(x => x, StringComparer.Ordinal).ToArray())
+        foreach (var deviceId in unfinished)
         {
             _logger.LogWarning(
-                "OTA 设备未在时限内完成升级，AgingNumber={AgingNumber}, Seq={Seq}, Level={Level}, DeviceId={DeviceId}",
+                "OTA 设备未在时限内完成升级，标记失败并留给更高层重试，AgingNumber={AgingNumber}, Seq={Seq}, Level={Level}, DeviceId={DeviceId}",
                 agingNumber,
                 state.Seq,
                 level,
                 deviceId);
 
+            // 这里只标 failed，不写 fault：failed 设备允许在后续层重新下发，
+            // 每层都写会重复告警；统一在批次收尾时给"最终仍未成功"的设备写一次。
             await _repository.SetTargetStatusAsync(
                 agingNumber,
                 state.Seq,
                 deviceId,
                 OtaTargetStatuses.Failed);
-
-            if (_raiseFaultOnIncomplete)
-                await SaveFaultAsync(agingNumber, deviceId, state.Seq, "ota_level_timeout", message);
-        }
-
-        await _repository.ClearLevelPendingAsync(agingNumber, state.Seq, level);
-
-        // 首层门禁：第 1 层（根节点）没升起来，后续层再下发也没意义，直接收尾整批。
-        // 只认"已下发但未确认"的超时失败；空层快跳（candidates 为 0）走的是
-        // StartLevelAsync → AdvanceLevelAsync，不经过这里，不会被误判成失败。
-        if (_abortOnFirstLevelFailure && level == 1)
-        {
-            _logger.LogWarning(
-                "OTA 首层节点升级失败，中止整个批次，后续层不再下发，AgingNumber={AgingNumber}, Seq={Seq}, Failed={FailedCount}",
-                agingNumber,
-                state.Seq,
-                pending.Count);
-
-            await FinishBatchAsync(agingNumber, state, "首层节点升级失败，中止整批");
-            return;
         }
 
         if (_abortOnLevelTimeout)
@@ -492,7 +512,58 @@ public sealed class OtaUpgradeService : BackgroundService
             return;
         }
 
-        await CompleteLevelAsync(agingNumber, state, "本层等待超时，跳过并继续下一层");
+        // 本层没有设备确认升级，mesh 就不会重组，等稳定期是白等，
+        // 因此与"空层快跳"一致直接进下一层，不等 LevelStabilizeSeconds。
+        // failed 设备若重启后 MeshLevel 上移，会在更高层重新进入下发名单。
+        _logger.LogInformation(
+            "OTA 第 {Level} 层等待超时，跳过本层直接进入下一层，AgingNumber={AgingNumber}, Seq={Seq}, Failed={FailedCount}",
+            level,
+            agingNumber,
+            state.Seq,
+            unfinished.Length);
+
+        await AdvanceLevelAsync(agingNumber, state);
+    }
+
+    /// <summary>
+    /// 层间 mesh 稳定等待：不再死等固定时长，而是每次轮询读按架在线列表
+    /// lgw:ota:{AgingNumber} 的个数，回到首次下发时的水平即认为设备都回来了、
+    /// mesh 已重建完成，立即进入下一层；超过 `LevelStabilizeSeconds` 仍未达标
+    /// 则按超时直接进入下一层，不再继续等。
+    /// </summary>
+    private async Task VerifyStabilizeAsync(string agingNumber, OtaBatchState state)
+    {
+        var current = await _devices.GetOtaRackOnlineCountAsync(agingNumber);
+        var expected = state.ExpectedOnlineCount;
+
+        // 用 >= 而不是 ==：等待期间若有新设备上线，个数超过基准同样说明网络已恢复，
+        // 不该因为"多出来一台"而卡到超时。
+        if (expected.HasValue && current >= expected.Value)
+        {
+            _logger.LogInformation(
+                "OTA mesh 已稳定，在线数回到基准，直接进入下一层，AgingNumber={AgingNumber}, Seq={Seq}, Level={Level}, OnlineCount={OnlineCount}, Expected={Expected}",
+                agingNumber,
+                state.Seq,
+                state.CurrentLevel,
+                current,
+                expected.Value);
+
+            await AdvanceLevelAsync(agingNumber, state);
+            return;
+        }
+
+        if (state.StabilizeUntilUtc.HasValue && DateTime.UtcNow < state.StabilizeUntilUtc.Value)
+            return;
+
+        _logger.LogWarning(
+            "OTA mesh 稳定等待超时（或无基准在线数），直接进入下一层，AgingNumber={AgingNumber}, Seq={Seq}, Level={Level}, OnlineCount={OnlineCount}, Expected={Expected}",
+            agingNumber,
+            state.Seq,
+            state.CurrentLevel,
+            current,
+            expected?.ToString() ?? "<empty>");
+
+        await AdvanceLevelAsync(agingNumber, state);
     }
 
     private async Task CompleteLevelAsync(string agingNumber, OtaBatchState state, string reason)
@@ -522,12 +593,95 @@ public sealed class OtaUpgradeService : BackgroundService
 
         if (state.CurrentLevel > _maxMeshLevel)
         {
+            // 层都走完了，但名单里可能还有设备从未被下发过（节点重启后 MeshLevel 上移，
+            // 分层清单里始终没出现过它）。先进入补发阶段把它们补齐，再收尾。
+            state.LevelStatus = OtaLevelStatuses.Finalizing;
+            state.StabilizeUntilUtc = null;
             await _repository.SaveBatchStateAsync(agingNumber, state);
-            await FinishBatchAsync(agingNumber, state, "已达到 Mesh 层级上限");
             return;
         }
 
         await _repository.SaveBatchStateAsync(agingNumber, state);
+    }
+
+    /// <summary>
+    /// 收尾补发：所有 Mesh 层级都已走完，把 targets 里"从未被下发过"的设备直接发一次
+    /// ota（不再按 mesh 分层），发完立即收尾。
+    /// </summary>
+    private async Task FinalizeDispatchAsync(
+        string agingNumber,
+        OtaBatchState state,
+        CancellationToken cancellationToken)
+    {
+        var targets = await _repository.GetTargetsAsync(agingNumber, state.Seq);
+        var dispatched = await _repository.GetDispatchedAllAsync(agingNumber, state.Seq);
+
+        var missing = targets
+            .Where(item => IsDispatchable(item.Value) && !dispatched.Contains(item.Key))
+            .Select(item => item.Key)
+            .OrderBy(deviceId => deviceId, StringComparer.Ordinal)
+            .ToArray();
+
+        if (missing.Length == 0)
+        {
+            await FinishBatchAsync(agingNumber, state, "分层下发结束，名单设备均已被下发过");
+            return;
+        }
+
+        _logger.LogWarning(
+            "OTA 分层下发结束，仍有 {MissingCount} 台设备从未被下发，开始兜底补发，AgingNumber={AgingNumber}, Seq={Seq}, DeviceIds={DeviceIds}",
+            missing.Length,
+            agingNumber,
+            state.Seq,
+            string.Join(",", missing));
+
+        foreach (var deviceId in missing)
+        {
+            // 补发后不等确认，因此不记录版本基线（记录了也没人比对）。
+            if (!await _devices.IsDeviceOnlineAsync(deviceId))
+            {
+                _logger.LogWarning(
+                    "OTA 兜底补发目标设备不在线，跳过，AgingNumber={AgingNumber}, Seq={Seq}, DeviceId={DeviceId}",
+                    agingNumber,
+                    state.Seq,
+                    deviceId);
+
+                await _repository.SetTargetStatusAsync(
+                    agingNumber,
+                    state.Seq,
+                    deviceId,
+                    OtaTargetStatuses.Skipped);
+                continue;
+            }
+
+            var recordId = await _repository.GetRecordIdAsync(agingNumber, state.Seq, deviceId);
+            try
+            {
+                await _mqtt.PublishAsync(
+                    BuildOtaTopic(deviceId),
+                    BuildOtaPayload(state, recordId),
+                    cancellationToken);
+
+                await _repository.AddDispatchedAsync(agingNumber, state.Seq, deviceId);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "OTA 兜底补发下发失败，AgingNumber={AgingNumber}, Seq={Seq}, DeviceId={DeviceId}",
+                    agingNumber,
+                    state.Seq,
+                    deviceId);
+            }
+        }
+
+        // 按约定补发后不等设备确认，直接收尾：刚下发的设备仍是 pending，
+        // FinishBatchAsync 会把它们统一标成 skipped，补发名单在上面这条日志里可追溯。
+        await FinishBatchAsync(agingNumber, state, "分层下发结束，已对未下发设备兜底补发");
     }
 
     private async Task FinishBatchAsync(string agingNumber, OtaBatchState state, string reason)
@@ -569,6 +723,27 @@ public sealed class OtaUpgradeService : BackgroundService
         var skipped = final.Count(x =>
             string.Equals(x.Value, OtaTargetStatuses.Skipped, StringComparison.Ordinal));
 
+        // failed 设备在整个批次里可能已被重试过多次（每次层级上移都会再发一次），
+        // 逐层写 fault 会重复告警，因此只在批次收尾时对"最终仍未成功"的设备写一次。
+        if (_raiseFaultOnIncomplete)
+        {
+            var message =
+                $"OTA 分层批次结束，设备仍未完成升级，AgingNumber={agingNumber}, Seq={state.Seq}";
+
+            foreach (var item in final
+                .Where(x => string.Equals(x.Value, OtaTargetStatuses.Failed, StringComparison.Ordinal))
+                .OrderBy(x => x.Key, StringComparer.Ordinal)
+                .ToArray())
+            {
+                await SaveFaultAsync(
+                    agingNumber,
+                    item.Key,
+                    state.Seq,
+                    "ota_upgrade_failed",
+                    message);
+            }
+        }
+
         _logger.LogWarning(
             "OTA 分层批次结束，AgingNumber={AgingNumber}, Seq={Seq}, Reason={Reason}, Total={Total}, Upgraded={Upgraded}, Failed={Failed}, Skipped={Skipped}",
             agingNumber,
@@ -580,16 +755,37 @@ public sealed class OtaUpgradeService : BackgroundService
             skipped);
     }
 
+    /// <summary>
+    /// 单层超时 = BaseTimeoutMinutes + (层-1)×TimeoutIncrementMinutes，
+    /// 再按 MaxLevelTimeoutMinutes 封顶（未配置则不封顶）。
+    /// </summary>
     private TimeSpan LevelTimeout(int level)
-        => _baseTimeout + TimeSpan.FromTicks(_timeoutIncrement.Ticks * Math.Max(0, level - 1));
+    {
+        var timeout = _baseTimeout +
+            TimeSpan.FromTicks(_timeoutIncrement.Ticks * Math.Max(0, level - 1));
+
+        return _maxLevelTimeout.HasValue && timeout > _maxLevelTimeout.Value
+            ? _maxLevelTimeout.Value
+            : timeout;
+    }
 
     /// <summary>
-    /// 是否还能下发。pending 是尚未下发过的，skipped 是曾因离线或发布失败而未下发、
-    /// 允许在后续层重试的；upgraded 已成功、failed 已下发但未确认，都不再重复下发。
+    /// 是否还能下发：只要"还没升级成功"就再给一次机会。
+    /// pending = 尚未下发过；skipped = 曾因离线或发布失败未下发；
+    /// failed = 下发过但在时限内没确认版本号变化，允许在后续层重试。
+    ///
+    /// 之所以允许重试 failed：节点重启后 MeshLevel 可能上移，它会在更高层重新进入清单；
+    /// 若 MeshLevel 没变，它就不会出现在更高层清单里，自然不会重复下发，
+    /// 因此重试次数被"真实的层级变化"天然限制住，不需要额外的重试计数。
+    /// 只有 upgraded（版本号已变化，确认升级成功）才真正不再下发。
     /// </summary>
     private static bool IsDispatchable(string status)
-        => string.Equals(status, OtaTargetStatuses.Pending, StringComparison.Ordinal) ||
-           string.Equals(status, OtaTargetStatuses.Skipped, StringComparison.Ordinal);
+        => !string.Equals(status, OtaTargetStatuses.Upgraded, StringComparison.Ordinal);
+
+    /// <summary>名单里该设备是否已确认升级成功。</summary>
+    private static bool IsUpgraded(Dictionary<string, string> targets, string deviceId)
+        => targets.TryGetValue(deviceId, out var status) &&
+           string.Equals(status, OtaTargetStatuses.Upgraded, StringComparison.Ordinal);
 
     /// <summary>
     /// 旧版本为空（设备从未上报过 Version）时，以"升级后版本号变为非空"判定成功。

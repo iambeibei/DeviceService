@@ -68,6 +68,16 @@ public sealed class DeviceRepository
 
         await _redis.ListRightPushAsync(RedisKeys.OnlineDeviceList, onlineJson);
 
+        // 按老化架维护的在线列表 lgw:ota:{AgingNumber}：不分设备类型，架号有效即收录。
+        // 换架时先清掉旧架条目，避免同一台设备同时留在两个架的列表里。
+        await RemoveFromOtaRackOnlineListAsync(previous?.AgingNumber, deviceId);
+        if (agingNumber is not null)
+        {
+            var otaRackList = RedisKeys.OtaRackOnlineDevices(agingNumber);
+            await RemoveDeviceFromOnlineListAsync(otaRackList, deviceId);
+            await _redis.ListRightPushAsync(otaRackList, onlineJson);
+        }
+
         if (agingNumber is not null && string.Equals(deviceType, "1", StringComparison.Ordinal))
         {
             var rackList = RedisKeys.AgingRackOnlineDeviceList(agingNumber);
@@ -140,6 +150,15 @@ public sealed class DeviceRepository
     {
         await _redis.HashSetAsync(RedisKeys.DeviceRuntime(deviceId),[new HashEntry("FirewareVersion", version)]);
     }
+
+    /// <summary>
+    /// 读取按老化架维护的在线列表 lgw:ota:{AgingNumber} 的元素个数。
+    /// OTA 用它判断 mesh 是否稳定：升级重启会让设备短暂掉线，个数回到首次下发时的
+    /// 水平即认为网络已重建完成。
+    /// </summary>
+    public async Task<long> GetOtaRackOnlineCountAsync(string agingNumber)
+        => await _redis.ListLengthAsync(
+            RedisKeys.OtaRackOnlineDevices(RedisKeys.NormalizeAgingNumber(agingNumber)));
 
     public async Task StepIDSaveToRuntime(string deviceId, string StepId)
     {
@@ -253,10 +272,34 @@ public sealed class DeviceRepository
         return removed;
     }
 
+    /// <summary>
+    /// 从按老化架维护的在线列表 lgw:ota:{AgingNumber} 移除该设备。
+    /// 架号非法（历史脏数据）时静默跳过——清理失败不能影响上下线主流程。
+    /// </summary>
+    private async Task RemoveFromOtaRackOnlineListAsync(string? agingNumber, string deviceId)
+    {
+        if (string.IsNullOrWhiteSpace(agingNumber))
+            return;
+
+        try
+        {
+            await RemoveDeviceFromOnlineListAsync(
+                RedisKeys.OtaRackOnlineDevices(agingNumber),
+                RedisKeys.Normalize(deviceId));
+        }
+        catch (ArgumentException)
+        {
+            // 旧架号非法，跳过清理。
+        }
+    }
+
     private async Task RemoveDeviceFromClassifiedOnlineListAsync(
         DeviceNode? device,
         string deviceId)
     {
+        // 按架在线列表不分设备类型，架号有效即移除。
+        await RemoveFromOtaRackOnlineListAsync(device?.AgingNumber, deviceId);
+
         if (string.IsNullOrWhiteSpace(device?.AgingNumber))
             return;
 

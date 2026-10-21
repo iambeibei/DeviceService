@@ -20,6 +20,13 @@ namespace DeviceService.Mqtt
 
         private readonly MqttSettings _mqttSettings;
 
+        /// <summary>
+        /// 是否打印每一条收到的上行消息。默认关闭：老化采样数据频率很高，
+        /// 全量打印会淹没其它日志。排查"消息到底有没有进来"时打开。
+        /// </summary>
+        private readonly bool _logIncoming;
+        private const int MaxLoggedPayloadLength = 500;
+
 
 
 
@@ -42,6 +49,8 @@ namespace DeviceService.Mqtt
 
             _mqttSettings = config.GetSection("MqttSettings").Get<MqttSettings>()
                ?? throw new InvalidOperationException("MqttSettings not configured");
+
+            _logIncoming = config.GetValue<bool?>("MqttSettings:LogIncomingMessages") ?? false;
 
             var optionBuilder = new MqttClientOptionsBuilder()
                   .WithTcpServer(_mqttSettings.Broker, _mqttSettings.Port)
@@ -81,6 +90,20 @@ namespace DeviceService.Mqtt
             //接收回调
             _client.ApplicationMessageReceivedAsync += async e =>
             {
+                // 接收侧本来是完全静默的：消息写进通道后就没有任何痕迹，
+                // 控制台上看不出"到底有没有收到"。排查时打开这个开关即可。
+                if (_logIncoming)
+                {
+                    var payload = e.ApplicationMessage.ConvertPayloadToString();
+                    if (payload.Length > MaxLoggedPayloadLength)
+                        payload = payload[..MaxLoggedPayloadLength] + "...";
+
+                    _logger.LogInformation(
+                        "收到 MQTT 消息，Topic={Topic}, Payload={Payload}",
+                        e.ApplicationMessage.Topic,
+                        payload);
+                }
+
                 // 异步写入通道，不阻塞 MQTT 事件循环
                 await _messageChannel.Writer.WriteAsync(new MqttApplicationMessage
                 {

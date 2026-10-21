@@ -5,7 +5,8 @@ namespace Bluetti.Device.Redis;
 /// 在线结构：
 /// 1. lgw:devices:online 为全量 List，元素为 {"id":"...","type":"...","AgingNumber":"0"|null}
 /// 2. lgw:devices:online:aging:{AgingNumber} 为各架 type=1 点位 List；online:control 为 type=2 总控 List。
-/// 3. lgw:device:{deviceId}:runtime 为设备运行状态 Hash。
+/// 3. lgw:ota:{AgingNumber} 为各架在线 List，**不分设备类型**（点位与总控都收录），由上下线生命周期维护。
+/// 4. lgw:device:{deviceId}:runtime 为设备运行状态 Hash。
 /// </summary>
 public static class RedisKeys
 {
@@ -24,6 +25,16 @@ public static class RedisKeys
 
     public static string AgingRackOnlineDeviceList(string agingNumber)
         => $"{Prefix}:devices:online:aging:{NormalizeAgingNumber(agingNumber)}";
+
+    /// <summary>
+    /// 按老化架维护的在线设备 List：lgw:ota:{AgingNumber}（例如 lgw:ota:1）。
+    /// 与 lgw:devices:online 同构、同样由上下线生命周期维护、不设过期，区别是：
+    /// ① 按架隔离；② **不分设备类型**（点位与总控都收录），而
+    /// lgw:devices:online:aging:{n} 只收录 type=1。
+    /// 注意与 lgw:ota:{AgingNumber}:{MeshLevel}（OTA 分层清单）区分——那个带层级后缀。
+    /// </summary>
+    public static string OtaRackOnlineDevices(string agingNumber)
+        => $"{Prefix}:ota:{NormalizeAgingNumber(agingNumber)}";
 
     // 命令基础设施。
     public const string CommandSequence = $"{Prefix}:cmd:seq";
@@ -114,9 +125,22 @@ public static class RedisKeys
     public static string OtaBatchLevelVersions(string agingNumber, long seq, int level)
         => $"{OtaBatchLevelRoot(agingNumber, seq, level)}:versions";
 
-    /// <summary>该层已下发、等待版本号变化确认的设备。移空即本层完成。</summary>
-    public static string OtaBatchLevelPending(string agingNumber, long seq, int level)
-        => $"{OtaBatchLevelRoot(agingNumber, seq, level)}:pending";
+    /// <summary>
+    /// 当前层已下发 ota 指令的设备集合，**进入下一层时清空**。
+    /// 完成判定：集合里的设备在 targets 中全部变成 upgraded 即本层完成。
+    /// 关键点是比对 targets 的**最新**状态而不是本层的确认记录——
+    /// 设备在更高层被重新下发并升级成功，也算本层完成，
+    /// 这样 mesh 层级漂移才不会让低层永远等不齐、只能靠超时推进。
+    /// </summary>
+    public static string OtaBatchDispatched(string agingNumber, long seq)
+        => $"{OtaBatchRoot(agingNumber, seq)}:dispatched";
+
+    /// <summary>
+    /// 本批累计下发过的设备集合，只用于收尾补发阶段与 targets 取差集，
+    /// 找出"从未被下发过"的设备。不参与层内过滤与完成判定。
+    /// </summary>
+    public static string OtaBatchDispatchedAll(string agingNumber, long seq)
+        => $"{OtaBatchRoot(agingNumber, seq)}:dispatched:all";
 
     private static string OtaBatchRoot(string agingNumber, long seq)
     {

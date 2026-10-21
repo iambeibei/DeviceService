@@ -29,8 +29,16 @@ public sealed class OtaBatchState
     /// <summary>
     /// 层间 mesh 稳定等待的截止时刻。上一层升级重启会让下层设备短暂掉线，
     /// 等设备重新上线回到分层清单后再取下一层交集，否则会被误判成"不在名单里"。
+    /// 到达该时刻仍未稳定就直接进入下一层。
     /// </summary>
     public DateTime? StabilizeUntilUtc { get; set; }
+
+    /// <summary>
+    /// 首次真正下发 ota 时读取的 lgw:ota:{AgingNumber}（按架在线列表）元素个数，
+    /// 作为 mesh 稳定的基准。稳定等待期每次轮询重新读该列表个数，
+    /// 达到这个数即认为设备都回来了、mesh 已重建完成，可提前进入下一层。
+    /// </summary>
+    public int? ExpectedOnlineCount { get; set; }
 
     /// <summary>平台下发的 DeviceInfos 总数，即成功率统计的分母。</summary>
     public int TotalCount { get; set; }
@@ -61,6 +69,12 @@ public static class OtaLevelStatuses
 
     /// <summary>本层已结束，正在等待 mesh 稳定后进入下一层。</summary>
     public const string Stabilizing = "stabilizing";
+
+    /// <summary>
+    /// 所有 Mesh 层级都已走完，正在对"从未被下发过"的设备做兜底补发。
+    /// 节点重启后 MeshLevel 可能上移，分层下发覆盖不到它们，补发完即收尾。
+    /// </summary>
+    public const string Finalizing = "finalizing";
 }
 
 /// <summary>

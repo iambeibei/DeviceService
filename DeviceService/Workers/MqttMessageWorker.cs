@@ -37,6 +37,13 @@ namespace DeviceService.Works
                     {
                         if (handler.CanHandle(message.Topic))
                         {
+                            // 正常处理完不打日志（多数 handler 的正常路径也是静默的），
+                            // 想知道"这条消息落到哪个 handler"时把日志级别调到 Debug。
+                            _logger.LogDebug(
+                                "消息已交由 {Handler} 处理，Topic={Topic}",
+                                handler.GetType().Name,
+                                message.Topic);
+
                             await handler.HandleAsync(message);
                             handled = true;
                             break; // 一个消息仅由一个处理器处理，可根据需求调整

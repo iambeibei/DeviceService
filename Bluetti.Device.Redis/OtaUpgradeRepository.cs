@@ -155,37 +155,35 @@ public sealed class OtaUpgradeRepository
         return raw.IsNullOrEmpty ? null : raw.ToString();
     }
 
-    public async Task AddLevelPendingAsync(
-        string agingNumber,
-        long seq,
-        int level,
-        string deviceId)
+    /// <summary>记录当前层已下发 ota 指令的设备。进入下一层时清空。</summary>
+    public async Task AddDispatchedAsync(string agingNumber, long seq, string deviceId)
     {
-        var key = RedisKeys.OtaBatchLevelPending(agingNumber, seq, level);
+        var key = RedisKeys.OtaBatchDispatched(agingNumber, seq);
         await _redis.SetAddAsync(key, RedisKeys.Normalize(deviceId));
         await _redis.KeyExpireAsync(key, RedisTtl.OtaBatch);
     }
 
-    public Task<bool> RemoveLevelPendingAsync(
-        string agingNumber,
-        long seq,
-        int level,
-        string deviceId)
-        => _redis.SetRemoveAsync(
-            RedisKeys.OtaBatchLevelPending(agingNumber, seq, level),
-            RedisKeys.Normalize(deviceId));
+    /// <summary>清空当前层的已下发集合，准备记录下一层。</summary>
+    public Task<bool> ClearDispatchedAsync(string agingNumber, long seq)
+        => _redis.KeyDeleteAsync(RedisKeys.OtaBatchDispatched(agingNumber, seq));
 
-    public async Task<IReadOnlySet<string>> GetLevelPendingAsync(
-        string agingNumber,
-        long seq,
-        int level)
+    /// <summary>累计记录本批下发过的设备，只用于收尾补发时与 targets 取差集。</summary>
+    public async Task AddDispatchedAllAsync(string agingNumber, long seq, string deviceId)
+    {
+        var key = RedisKeys.OtaBatchDispatchedAll(agingNumber, seq);
+        await _redis.SetAddAsync(key, RedisKeys.Normalize(deviceId));
+        await _redis.KeyExpireAsync(key, RedisTtl.OtaBatch);
+    }
+
+    public async Task<IReadOnlySet<string>> GetDispatchedAsync(string agingNumber, long seq)
         => new HashSet<string>(
-            await _redis.SetMembersAsync(
-                RedisKeys.OtaBatchLevelPending(agingNumber, seq, level)),
+            await _redis.SetMembersAsync(RedisKeys.OtaBatchDispatched(agingNumber, seq)),
             StringComparer.Ordinal);
 
-    public Task<bool> ClearLevelPendingAsync(string agingNumber, long seq, int level)
-        => _redis.KeyDeleteAsync(RedisKeys.OtaBatchLevelPending(agingNumber, seq, level));
+    public async Task<IReadOnlySet<string>> GetDispatchedAllAsync(string agingNumber, long seq)
+        => new HashSet<string>(
+            await _redis.SetMembersAsync(RedisKeys.OtaBatchDispatchedAll(agingNumber, seq)),
+            StringComparer.Ordinal);
 
     /// <summary>
     /// 读取某架某 Mesh 层级的设备清单 lgw:ota:{AgingNumber}:{MeshLevel}，

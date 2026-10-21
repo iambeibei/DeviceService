@@ -109,6 +109,9 @@ public sealed class RedisHelper
     public Task<long> ListRemoveAsync(string key, string value, long count = 0)
         => _db.ListRemoveAsync(key, value, count);
 
+    public Task<long> ListLengthAsync(string key)
+        => _db.ListLengthAsync(key);
+
     public async Task<long> NextSequenceAsync(string key)
     {
         var value = await _db.StringIncrementAsync(key);
