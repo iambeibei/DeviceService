@@ -36,6 +36,7 @@ public sealed class RedisCmdWorker : BackgroundService
     private readonly TimeSpan _replyTimeout;
     private readonly TimeSpan _publishRetryDelay;
     private readonly TimeSpan _startAgingStagger;
+    private readonly int _timeoutRetryCount;
 
     private readonly ConcurrentDictionary<string, DeviceCommandQueue> _deviceQueues =
         new(StringComparer.Ordinal);
@@ -82,6 +83,12 @@ public sealed class RedisCmdWorker : BackgroundService
             throw new InvalidOperationException(
                 "CommandProcessing:StartAgingStaggerMilliseconds 不能为负数");
         _startAgingStagger = TimeSpan.FromMilliseconds(staggerMilliseconds);
+
+        // 等待回复超时后的重试次数。0 = 关闭（恢复原有行为）。
+        // start_aging 永远不重试（见 ProcessOneCommandAsync 的 allowTimeoutRetry）。
+        var timeoutRetry = configuration.GetValue<int?>(
+            "CommandProcessing:TimeoutRetryCount") ?? 1;
+        _timeoutRetryCount = timeoutRetry > 0 ? timeoutRetry : 0;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -424,7 +431,11 @@ public sealed class RedisCmdWorker : BackgroundService
                         // 已经实际发布过/处理过的历史项不应继续出现在未运行 TaskQueue。
                         await _devices.RemovePendingAgingTaskAsync(deviceId, item.Command.Seq);
 
-                        var terminal = await ProcessOneCommandAsync(deviceId, item, ct);
+                        var terminal = await ProcessOneCommandAsync(
+                            deviceId,
+                            item,
+                            ct,
+                            allowTimeoutRetry: false);
                         if (string.Equals(terminal.Status, CommandStates.Failed, StringComparison.OrdinalIgnoreCase))
                         {
                             await _agingGate.ReleaseAfterCommandFailureAsync(deviceId, ct);
@@ -483,7 +494,8 @@ public sealed class RedisCmdWorker : BackgroundService
                             // MQTT Publish 真正成功后，这条 Seq 已不再属于“未运行任务”。
                             await _devices.RemovePendingAgingTaskAsync(deviceId, item.Command.Seq);
                             await _devices.SetCurrentAgingTaskIdAsync(deviceId, item.Command.Seq, item.Command.RecordId);
-                        });
+                        },
+                        allowTimeoutRetry: false);
 
                     // start_aging 的发送门只在以下两种情况下释放：
                     // 1. 下位机明确回复失败（failed）；
@@ -575,13 +587,19 @@ public sealed class RedisCmdWorker : BackgroundService
         string deviceId,
         QueuedCommand item,
         CancellationToken ct,
-        Func<Task>? onPublished = null)
+        Func<Task>? onPublished = null,
+        bool allowTimeoutRetry = true)
     {
         var command = item.Command;
 
         // Stream Pending 恢复时，先看 Redis 中该命令是否其实已经进入终态。
         // 若回复已落库但进程在 XACK 前退出，这里只补 ACK，不重复 MQTT 下发。
         var persisted = await _commands.GetAsync(deviceId, command.Seq);
+
+        // 重启恢复时把已持久化的重试次数带回来，避免重启后重新从 0 计、无限重试。
+        if (persisted is not null && command.RetryCount == 0)
+            command.RetryCount = persisted.RetryCount;
+
         if (persisted is not null && CommandStates.IsTerminal(persisted.Status))
         {
             await CompleteBatchItemAsync(item.Batch, deviceId, command.Seq);
@@ -612,56 +630,93 @@ public sealed class RedisCmdWorker : BackgroundService
                 command.Seq);
         }
 
-        // 新命令（或上次 MQTT Publish 失败后仍为 queued 的命令）。
-        // Publish 失败时只重试当前设备当前命令；其他设备队列不受影响。
-        while (!ct.IsCancellationRequested)
+        CmdInfo completion;
+
+        // 「发布 + 等回复」整体包在重试循环里：等待回复超时也算一次失败机会。
+        // 重试点在 CompleteBatchItemAsync **之前**，因此此时尚未 XACK；
+        // 但重试仅限进程内循环，重试期间进程崩溃该命令仍会丢失（已知取舍）。
+        while (true)
         {
-            try
+            ct.ThrowIfCancellationRequested();
+
+            // 新命令（或上次 MQTT Publish 失败后仍为 queued 的命令）。
+            // Publish 失败时只重试当前设备当前命令；其他设备队列不受影响。
+            while (!ct.IsCancellationRequested)
             {
-                // 先成功交给 MQTT Broker，再写 published。
-                // 如果进程恰好在两者之间退出，Stream Entry 仍是 Pending 且状态仍为 queued，
-                // 重启后会用同一个 Seq 再发一次；设备端应按 Seq 去重，这比“命令实际没发出却被当成 published”更安全。
-                await PublishCommandAsync(command, ct);
+                try
+                {
+                    // 先成功交给 MQTT Broker，再写 published。
+                    // 如果进程恰好在两者之间退出，Stream Entry 仍是 Pending 且状态仍为 queued，
+                    // 重启后会用同一个 Seq 再发一次；设备端应按 Seq 去重，这比“命令实际没发出却被当成 published”更安全。
+                    await PublishCommandAsync(command, ct);
 
-                // 对 start_aging：Publish 成功即代表这条命令已经离开 TaskQueue，
-                // 并成为当前等待 agingIdle/agingStop/agingError 的任务。
-                if (onPublished is not null)
-                    await onPublished();
+                    // 对 start_aging：Publish 成功即代表这条命令已经离开 TaskQueue，
+                    // 并成为当前等待 agingIdle/agingStop/agingError 的任务。
+                    if (onPublished is not null)
+                        await onPublished();
 
-                await _commands.MarkPublishedAsync(command);
+                    await _commands.MarkPublishedAsync(command);
+                    break;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    await _commands.MarkQueuedAsync(command, ex.Message);
+
+                    _logger.LogWarning(
+                        ex,
+                        "MQTT 命令发布失败，将重试当前设备当前命令，DeviceId={DeviceId}, Seq={Seq}, RetryAfterMs={RetryAfterMs}",
+                        deviceId,
+                        command.Seq,
+                        _publishRetryDelay.TotalMilliseconds);
+
+                    await Task.Delay(_publishRetryDelay, ct);
+                }
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // MQTT 已发布，但此时绝不 XACK。
+            // 只有匹配 DeviceId + CmdSeq 的四类回复处理器完成落库，或等待回复超时，才结束这条 Stream 命令项。
+            // 对普通命令，timed_out 会自然放行下一条；对 start_aging，外层 ProcessAgingQueueAsync
+            // 会继续保持长期老化发送门，直到状态事件明确上报 agingIdle / agingStop / agingError。
+            var waited = await _commands.WaitForCompletionAsync(
+                deviceId,
+                command.Seq,
+                _replyTimeout,
+                ct);
+
+            if (waited is not null)
+            {
+                completion = waited;
                 break;
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                await _commands.MarkQueuedAsync(command, ex.Message);
 
-                _logger.LogWarning(
-                    ex,
-                    "MQTT 命令发布失败，将重试当前设备当前命令，DeviceId={DeviceId}, Seq={Seq}, RetryAfterMs={RetryAfterMs}",
-                    deviceId,
-                    command.Seq,
-                    _publishRetryDelay.TotalMilliseconds);
+            completion = await _commands.MarkTimedOutAsync(command, _replyTimeout);
 
-                await Task.Delay(_publishRetryDelay, ct);
-            }
+            // start_aging 绝不能因超时重发：超时只说明上位机没收到回复，
+            // 不能证明 ESP32 没执行，重发会重复消耗 PN（AgingCommandGate 就是为这个场景设计的）。
+            if (!allowTimeoutRetry || command.RetryCount >= _timeoutRetryCount)
+                break;
+
+            command.RetryCount++;
+
+            // 必须先复位再重试：WaitForCompletionAsync 遇终态会立即返回
+            // （timed_out 是终态），不复位的话下一次等待形同虚设。
+            await _commands.ResetForRetryAsync(deviceId, command.Seq);
+
+            _logger.LogWarning(
+                "命令等待回复超时，使用原 Seq 重试第 {RetryCount} 次，DeviceId={DeviceId}, Seq={Seq}, Action={Action}",
+                command.RetryCount,
+                deviceId,
+                command.Seq,
+                command.Action);
         }
 
-        // MQTT 已发布，但此时绝不 XACK。
-        // 只有匹配 DeviceId + CmdSeq 的四类回复处理器完成落库，或等待回复超时，才结束这条 Stream 命令项。
-        // 对普通命令，timed_out 会自然放行下一条；对 start_aging，外层 ProcessAgingQueueAsync
-        // 会继续保持长期老化发送门，直到状态事件明确上报 agingIdle / agingStop / agingError。
-        var completion = await _commands.WaitForCompletionAsync(
-            deviceId,
-            command.Seq,
-            _replyTimeout,
-            ct);
-
-        if (completion is null)
-            completion = await _commands.MarkTimedOutAsync(command, _replyTimeout);
+        ct.ThrowIfCancellationRequested();
 
         await CompleteBatchItemAsync(item.Batch, deviceId, command.Seq);
         LogTerminalResult(completion);

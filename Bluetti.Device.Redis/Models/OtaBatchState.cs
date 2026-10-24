@@ -3,9 +3,10 @@ namespace Bluetti.Device.Redis.Models;
 /// <summary>
 /// 一条 ota 指令在某个老化架上的分层升级批次，对应 lgw:ota:{AgingNumber}:run:{Seq}:state。
 ///
-/// 与旧方案的区别：不再等整架全部下载完成后广播重启，而是按 Mesh 层级从 1 开始逐层下发，
-/// 每层靠"设备固件版本号是否变化"判断该层是否重启成功，成功后再进入下一层。
-/// 这样根节点（第 1 层）先升级重建 mesh，下面的节点才不会在升级过程中失联。
+/// 按 Mesh 层级从 1 开始逐层下发，每层等设备上报 OTACP（固件下载完成）
+/// 后再等一个固定延时进入下一层。
+/// 注意：2026-10-22 起新固件升级**不再重启**，因此不再用"版本号变化"判断成功，
+/// 改为设备主动上报 OTACP；版本基线与 mesh 稳定计数判定已删除。
 /// </summary>
 public sealed class OtaBatchState
 {
@@ -18,6 +19,13 @@ public sealed class OtaBatchState
 
     /// <summary>当前正在处理的 Mesh 层级，从 1 开始。</summary>
     public int CurrentLevel { get; set; } = 1;
+
+    /// <summary>
+    /// 当前层内正在处理的小组序号（1 起）。每层按 `LevelGroupSize` 把该层设备切成若干组，
+    /// 一组全部处理完才下发下一组；本层所有组都处理完才进入下一层。
+    /// 进入新层时重置为 1（见 <c>AdvanceLevelAsync</c>）。
+    /// </summary>
+    public int CurrentGroupIndex { get; set; } = 1;
 
     public string LevelStatus { get; set; } = OtaLevelStatuses.Pending;
 
@@ -34,11 +42,32 @@ public sealed class OtaBatchState
     public DateTime? StabilizeUntilUtc { get; set; }
 
     /// <summary>
-    /// 首次真正下发 ota 时读取的 lgw:ota:{AgingNumber}（按架在线列表）元素个数，
-    /// 作为 mesh 稳定的基准。稳定等待期每次轮询重新读该列表个数，
-    /// 达到这个数即认为设备都回来了、mesh 已重建完成，可提前进入下一层。
+    /// 当前小组已补发（重发 ota 指令）的次数。每 `ResendIntervalMinutes` 分钟补发一次，
+    /// 进入新小组时清零。用于在日志里标记"这是第几次补发"。
     /// </summary>
-    public int? ExpectedOnlineCount { get; set; }
+    public int ResendCount { get; set; }
+
+    /// <summary>
+    /// 下一次补发的时刻。当前小组内有设备迟迟不上报 OTACP 时，
+    /// 到点就把升级指令重发一次（payload 里的 Seq 不变，设备按 Seq 幂等）。
+    /// </summary>
+    public DateTime? NextResendUtc { get; set; }
+
+    /// <summary>
+    /// 组间延时的截止时刻。一组处理完后要等 `GroupDelaySeconds`（默认 5 秒）才下发下一组，
+    /// 给设备端留一点收尾时间。本层最后一组不受影响（直接走层间延时）。
+    /// </summary>
+    public DateTime? GroupDelayUntilUtc { get; set; }
+
+    /// <summary>
+    /// `Restarting` 阶段的等待截止时刻。窗口内剩余设备全部升级完成就立即广播重启；
+    /// 到达该时刻仍有未完成的设备，也照常广播重启（不再继续等）。
+    /// </summary>
+    public DateTime? RestartDeadlineUtc { get; set; }
+
+    // 已删除 ExpectedOnlineCount（mesh 稳定基准在线数）：
+    // 新固件升级后设备不再重启，不会掉线、mesh 不会重组，在线数始终恒定，
+    // "回到基准即稳定"的判定恒为真、等于没有。层间改为固定 LevelStabilizeSeconds 延时。
 
     /// <summary>平台下发的 DeviceInfos 总数，即成功率统计的分母。</summary>
     public int TotalCount { get; set; }
@@ -75,6 +104,13 @@ public static class OtaLevelStatuses
     /// 节点重启后 MeshLevel 可能上移，分层下发覆盖不到它们，补发完即收尾。
     /// </summary>
     public const string Finalizing = "finalizing";
+
+    /// <summary>
+    /// 补发结束、但仍有没有升级完成的设备：等它们补齐后再广播重启。
+    /// 窗口内全部完成就立即重启；窗口到期仍有未完成也照常重启（不再等）。
+    /// 配置项 `RestartWaitTimeoutMinutes`（默认 20 分钟）。
+    /// </summary>
+    public const string Restarting = "restarting";
 }
 
 /// <summary>

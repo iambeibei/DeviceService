@@ -402,6 +402,20 @@ public sealed class GroupControlService : BackgroundService
         try
         {
             var state = await GetStateUnsafeAsync(agingNumber);
+
+            // 防旧：LastModeSeq 原先只写不读，导致迟到的旧模式上报能覆盖新模式。
+            // 模式切换会重置整架活动与 Generation，被旧报文覆盖代价很大。
+            if (state.LastModeSeq.HasValue && seq <= state.LastModeSeq.Value)
+            {
+                _logger.LogWarning(
+                    "忽略过期或重复的群控模式上报，AgingNumber={AgingNumber}, Mode={Mode}, Seq={Seq}, LastModeSeq={LastModeSeq}",
+                    agingNumber,
+                    mode,
+                    seq,
+                    state.LastModeSeq.Value);
+                return;
+            }
+
             var changed = state.Mode != mode;
 
             if (changed && mode == 2)
@@ -577,7 +591,21 @@ public sealed class GroupControlService : BackgroundService
                 return;
             }
 
+            // 防旧：原先 reportSeq 只做 >0 校验就直接覆盖 CurrentStage，
+            // 一条迟到的旧阶段上报会把阶段拉回去并误触 CPower 供电控制。
+            if (state.LastStageSeq.HasValue && reportSeq <= state.LastStageSeq.Value)
+            {
+                _logger.LogWarning(
+                    "忽略过期或重复的阶段上报，AgingNumber={AgingNumber}, Stage={Stage}, ReportSeq={ReportSeq}, LastStageSeq={LastStageSeq}",
+                    agingNumber,
+                    stage,
+                    reportSeq,
+                    state.LastStageSeq.Value);
+                return;
+            }
+
             state.CurrentStage = stage;
+            state.LastStageSeq = reportSeq;
             await _repository.SaveStateAsync(agingNumber, state);
             await EnsureCurrentPowerUnsafeAsync(
                 agingNumber,
@@ -1698,6 +1726,15 @@ public sealed class GroupControlService : BackgroundService
 
             if (attempt > 0)
             {
+                // 必须先复位、再重发。
+                // 原实现是"先重发、后 ResetForRetryAsync"，顺序反了：
+                // ResetForRetryAsync 会清空 ResultCode / ReplyJson / CompletedAtUtc，
+                // 若设备在重发与复位之间就回了确认，这次确认会被随后的复位直接抹掉，
+                // 于是永远等不到回复、白白多一次重发。
+                // 复位用意是让 WaitForCompletionAsync 不再遇终态立即返回（否则重试形同虚设）。
+                foreach (var deviceId in pending)
+                    await _commands.ResetForRetryAsync(deviceId, seq);
+
                 // 重发必须复用原 Seq：设备端按 Seq/CmdSeq 幂等去重，换 Seq 会造成重复放行。
                 try
                 {
@@ -1720,9 +1757,6 @@ public sealed class GroupControlService : BackgroundService
                         seq,
                         attempt);
                 }
-
-                foreach (var deviceId in pending)
-                    await _commands.ResetForRetryAsync(deviceId, seq);
             }
 
             // 每台设备各自等待、并发进行；单台异常不影响其它设备。

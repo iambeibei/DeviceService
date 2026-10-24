@@ -156,6 +156,50 @@ public sealed class DeviceRepository
     /// OTA 用它判断 mesh 是否稳定：升级重启会让设备短暂掉线，个数回到首次下发时的
     /// 水平即认为网络已重建完成。
     /// </summary>
+    /// <summary>
+    /// 读取已发现设备目录 lgw:devices（Set，不是在线列表）。
+    /// 在线状态对账需要它：只遍历在线名单发现不了"服务停机期间上线过、
+    /// 但 up_line 丢失"的设备——它们根本不在名单里。
+    /// </summary>
+    public async Task<IReadOnlySet<string>> GetKnownDeviceIdsAsync()
+        => new HashSet<string>(
+            await _redis.SetMembersAsync(RedisKeys.DeviceSet),
+            StringComparer.Ordinal);
+
+    /// <summary>
+    /// 读取按老化架维护的在线列表 lgw:ota:{AgingNumber} 中的设备 ID。
+    /// OTA 建立升级任务表时用它筛掉离线设备（只按在线列表建表会丢 RecordId，
+    /// 只按平台名单建表会给离线设备白等一轮超时，所以调用方取两者交集）。
+    /// </summary>
+    public async Task<IReadOnlySet<string>> GetOtaRackOnlineDeviceIdsAsync(string agingNumber)
+    {
+        var items = await _redis.ListRangeAsync(
+            RedisKeys.OtaRackOnlineDevices(RedisKeys.NormalizeAgingNumber(agingNumber)));
+
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in items)
+        {
+            if (string.IsNullOrWhiteSpace(item))
+                continue;
+
+            try
+            {
+                var id = JObject.Parse(item)
+                    .GetValue("id", StringComparison.OrdinalIgnoreCase)
+                    ?.Value<string>();
+
+                if (!string.IsNullOrWhiteSpace(id))
+                    result.Add(RedisKeys.Normalize(id));
+            }
+            catch (JsonException)
+            {
+                // 非法历史元素不参与名单匹配。
+            }
+        }
+
+        return result;
+    }
+
     public async Task<long> GetOtaRackOnlineCountAsync(string agingNumber)
         => await _redis.ListLengthAsync(
             RedisKeys.OtaRackOnlineDevices(RedisKeys.NormalizeAgingNumber(agingNumber)));
@@ -513,7 +557,15 @@ public sealed class DeviceRepository
     /// <summary>
     /// 保存 device/{id}/data/aging 的最新值和设备独立历史 Stream。
     /// </summary>
-    public async Task SaveAgingDataAsync(
+    /// <summary>
+    /// 保存一条老化采样。
+    /// 返回值 <c>false</c> 表示"本条 IDNUM 与上次相同"，即疑似重复投递。
+    /// **注意：这是纯观测，数据照常入库，调用方不得据此跳过入库或跳过 HTTP 上报。**
+    /// 用途是回答两个问题：① 同一 IDNUM 是否真的会重复到达；② 新一轮老化 IDNUM
+    /// 是否从 0 重新开始。这两点决定了将来去重键能不能只用 PN+IDNUM
+    /// （若每轮从 0 开始，只用 PN+IDNUM 会误杀下一轮数据）。
+    /// </summary>
+    public async Task<bool> SaveAgingDataAsync(
         string deviceId,
         string? sn,
         int? currentStep,
@@ -527,6 +579,21 @@ public sealed class DeviceRepository
             throw new ArgumentException("老化数据 Data.SN（PN）不能为空，无法按 PN 分流保存。", nameof(sn));
 
         var pn = RedisKeys.NormalizePn(sn);
+
+        // 观测：与"上一次写进去的 IDNUM"比对。必须在覆盖写之前读。
+        var duplicate = false;
+        if (idNum.HasValue)
+        {
+            var lastIdNum = (await _redis.HashGetAsync(
+                RedisKeys.DeviceAgingLatest(deviceId, pn), "IDNUM")).ToString();
+
+            if (!string.IsNullOrWhiteSpace(lastIdNum) &&
+                string.Equals(lastIdNum, idNum.Value.ToString(), StringComparison.Ordinal))
+            {
+                duplicate = true;
+            }
+        }
+
         await MarkSeenAsync(deviceId, "data/aging", messageSeq);
         var now = DateTime.UtcNow;
 
@@ -565,6 +632,8 @@ public sealed class DeviceRepository
             ],
             maxLength: 100_000,
             ttl: RedisTtl.DeviceAgingHistory);
+
+        return !duplicate;
     }
 
     /// <summary>

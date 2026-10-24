@@ -14,16 +14,16 @@ namespace DeviceService.Handlers;
 public sealed class DeviceOfflineHandler : IMqttMessageHandler
 {
     private readonly DeviceRepository _devices;
-    private readonly GroupControlService _groupControl;
+    private readonly DeviceLifecycleService _lifecycle;
     private readonly ILogger<DeviceOfflineHandler> _logger;
 
     public DeviceOfflineHandler(
         DeviceRepository devices,
-        GroupControlService groupControl,
+        DeviceLifecycleService lifecycle,
         ILogger<DeviceOfflineHandler> logger)
     {
         _devices = devices;
-        _groupControl = groupControl;
+        _lifecycle = lifecycle;
         _logger = logger;
     }
 
@@ -60,44 +60,14 @@ public sealed class DeviceOfflineHandler : IMqttMessageHandler
             }
 
             var previous = await _devices.GetAsync(deviceId);
-            var removed = await _devices.SaveOfflineAsync(
-                deviceId,
-                deviceType,
-                seq,
-                payload);
 
-            // 从「架 + Mesh 层级」清单移除，避免 OTA 分层清单里残留已离线节点。
-            if (previous?.MeshLevel is not null &&
-                !string.IsNullOrWhiteSpace(previous.AgingNumber))
-            {
-                try
-                {
-                    await _devices.RemoveOtaMeshLevelAsync(
-                        deviceId,
-                        RedisKeys.NormalizeAgingNumber(previous.AgingNumber),
-                        previous.MeshLevel.Value);
-                }
-                catch (ArgumentException ex)
-                {
-                    _logger.LogWarning(
-                        ex,
-                        "架号非法，跳过 OTA 分层清单清理，DeviceId={DeviceId}, AgingNumber={AgingNumber}",
-                        deviceId,
-                        previous.AgingNumber);
-                }
-            }
-
-            // 先剔除屏障成员，再重估该架：
-            // 掉线设备不再上报阶段完成，若不移出 participants 会永久阻塞整架放行。
-            await _groupControl.HandleDeviceOfflineAsync(deviceId);
-            await _groupControl.ReevaluateMembershipAsync(
-                previous?.AgingNumber,
-                currentAgingNumber: null);
+            // 离线处理已下沉到 DeviceLifecycleService：在线状态对账复用同一条路径，
+            // 保证"清理在线列表 / OTA 分层清单 / 群控成员"三步不会被漏做。
+            var removed = await _lifecycle.MarkOfflineAsync(deviceId, deviceType, seq, payload);
 
             _logger.LogInformation(
-                "节点离线，DeviceId={DeviceId}, Type={DeviceType}, AgingNumber={AgingNumber}, RemovedFromOnlineList={Removed}",
+                "收到下线遗嘱消息，DeviceId={DeviceId}, AgingNumber={AgingNumber}, RemovedFromOnlineList={Removed}",
                 deviceId,
-                deviceType,
                 previous?.AgingNumber ?? "<empty>",
                 removed);
         }

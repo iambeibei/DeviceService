@@ -12,6 +12,14 @@ public sealed class GroupControlState
     public long? LastModeSeq { get; set; }
     public long? CurrentRunSeq { get; set; }
     public string CurrentStage { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 最近一次接受 agingStage 上报的 Seq，用于**防旧**：
+    /// 迟到的旧阶段上报不得覆盖新阶段，否则会误触发 CPower 供电控制。
+    /// 可空以兼容历史数据；null 时视为"尚无基准"，接受第一份上报。
+    /// </summary>
+    public long? LastStageSeq { get; set; }
+
     public string LastAppliedStage { get; set; } = string.Empty;
     public string LastAppliedControllerId { get; set; } = string.Empty;
     public string PendingNextStep { get; set; } = string.Empty;

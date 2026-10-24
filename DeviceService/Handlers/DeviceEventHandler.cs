@@ -52,22 +52,35 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
             return;
 
         var payload = Encoding.UTF8.GetString(message.Payload);
-        JObject json;
+
+        // 设备端 event/warn 历史上发送的是裸字符串而非 JSON。
+        // 原先解析失败就 LogError + return，导致这类告警 100% 丢弃。
+        // 现在对 warn / fault 容忍非 JSON：用原文作为告警正文；
+        // 其余事件类型（state / stepid）仍视为格式错误并 return。
+        JObject? json = null;
         try
         {
             json = JObject.Parse(payload);
         }
         catch (JsonException ex)
         {
-            _logger.LogError(
-                ex,
-                "设备事件 JSON 解析失败，Topic={Topic}, Payload={Payload}",
+            if (!IsTextPayloadEvent(eventType))
+            {
+                _logger.LogError(
+                    ex,
+                    "设备事件 JSON 解析失败，Topic={Topic}, Payload={Payload}",
+                    message.Topic,
+                    payload);
+                return;
+            }
+
+            _logger.LogWarning(
+                "收到非 JSON 的设备事件，按纯文本处理，Topic={Topic}, Payload={Payload}",
                 message.Topic,
                 payload);
-            return;
         }
 
-        var agingState = json.SelectToken("Data.AgingState")?.Value<string>();
+        var agingState = json?.SelectToken("Data.AgingState")?.Value<string>();
         var isStateEvent = eventType.Equals("state", StringComparison.OrdinalIgnoreCase) &&
                            !string.IsNullOrWhiteSpace(agingState);
 
@@ -77,7 +90,7 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
             {
                 DeviceID = deviceId,
                 type = eventType,
-                Message = json.SelectToken("Data.Msg")?.Value<string>() ?? "无",
+                Message = ExtractMessage(json, payload),
                 ReceivedAtUtc = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
             });
 
@@ -89,14 +102,15 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
             {
                 DeviceID = deviceId,
                 type = eventType,
-                Message = json.SelectToken("Data.Msg")?.Value<string>() ?? "无",
+                Message = ExtractMessage(json, payload),
                 ReceivedAtUtc = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
             });
 
             await _redisHelper.PublishAsync(RedisChannel.Literal(RedisKeys.channelFault), jsonFault);
 
         }
-        else if(eventType.Equals("stepid", StringComparison.OrdinalIgnoreCase))
+        else if(json is not null &&
+                eventType.Equals("stepid", StringComparison.OrdinalIgnoreCase))
         {
             var StepId = json.SelectToken("Data.StepId")?.Value<string>();
             await _devices.StepIDSaveToRuntime(deviceId, StepId);
@@ -107,9 +121,9 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
             await _devices.SaveEventAsync(
                 deviceId,
                 eventType,
-                json["Seq"]?.Value<long?>(),
+                json?["Seq"]?.Value<long?>(),
                 agingState,
-                json.SelectToken("Data.Msg")?.Value<string>(),
+                json?.SelectToken("Data.Msg")?.Value<string>(),
                 payload);
         }
         catch (Exception ex)
@@ -243,6 +257,26 @@ public sealed class DeviceEventHandler : IMqttMessageHandler
         // agingStart 保持下一条老化指令等待；agingIdle/agingStop/agingError 放行。
         // 即使 Redis 或业务 API 暂时异常，也优先遵循 ESP32 主动上报的真实状态。
         _agingGate.NotifyAgingState(deviceId, agingState);
+    }
+
+    /// <summary>
+    /// 允许 payload 为非 JSON 纯文本的事件类型。
+    /// 设备端 warn / fault 历史上直接发裸字符串，此时用原文作为告警正文。
+    /// </summary>
+    private static bool IsTextPayloadEvent(string eventType)
+        => eventType.Equals("warn", StringComparison.OrdinalIgnoreCase) ||
+           eventType.Equals("fault", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 取告警正文：优先 Data.Msg；没有 JSON（裸文本）时直接用原文。
+    /// </summary>
+    private static string ExtractMessage(JObject? json, string payload)
+    {
+        var message = json?.SelectToken("Data.Msg")?.Value<string>();
+        if (!string.IsNullOrWhiteSpace(message))
+            return message!;
+
+        return json is null ? payload : "无";
     }
 
     private static bool IsAgingStartState(string? state)

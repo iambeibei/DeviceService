@@ -32,6 +32,9 @@ builder.Services.AddSingleton<AgingCommandGate>();
 builder.Services.AddSingleton<AgingRecordCallbackClient>();
 builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<AgingRecordCallbackClient>());
 
+// 设备上下线的统一入口。Handler 与在线状态对账共用，保证离线三步动作不漏做。
+builder.Services.AddSingleton<DeviceLifecycleService>();
+
 builder.Services.AddSingleton<MqttConnection>();
 builder.Services.AddSingleton<GroupControlService>();
 builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<GroupControlService>());
@@ -43,6 +46,7 @@ builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<MqttCo
 //添加托管服务
 builder.Services.AddHostedService<MqttMessageWorker>();
 builder.Services.AddHostedService<RedisCmdWorker>();
+builder.Services.AddHostedService<OnlineStateRecoveryWorker>();
 
 builder.Services.AddMqttHandlers();
 

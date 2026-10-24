@@ -24,6 +24,13 @@ public sealed class CmdInfo
     public string? ReplyType { get; set; }
     public string? ReplyJson { get; set; }
 
+    /// <summary>
+    /// 等待回复超时的重试次数。仅普通命令使用，start_aging **不重试**——
+    /// 超时只说明上位机没收到回复，不能证明 ESP32 没执行，重发会重复消耗 PN。
+    /// 存在 Redis 命令 Hash 中，服务重启后不会重复计数。
+    /// </summary>
+    public int RetryCount { get; set; }
+
     [JsonIgnore]
     public string StatusKey => RedisKeys.DeviceCommandStatus(DeviceId, Seq);
 }
