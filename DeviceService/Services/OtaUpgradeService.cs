@@ -655,30 +655,58 @@ public sealed class OtaUpgradeService : BackgroundService
     }
 
     /// <summary>
-    /// 构造当前层的分组：取「targets ∩ 该层清单」的**全量快照**按 DeviceId 排序后切块。
+    /// 构造当前层的分组：取本层**成员快照**按 DeviceId 排序后切块。
     ///
-    /// 必须用全量快照而不是"仍待升级的设备"：后者每完成一台就少一台，
-    /// 组边界会漂移，`CurrentGroupIndex` 就会指向完全不同的设备。
-    /// 层清单由上下线事件维护，OTA 期间不重启，因此快照是稳定的。
+    /// 快照在进入该层时算一次并落库（`OtaBatchLevelMembers`），本层内所有判定都用它。
+    /// **绝不能每次按实时的 `lgw:ota:{架}:{层}` 清单重算**：
+    /// 设备一掉线就会被移出该清单，成员数缩水甚至变 0，
+    /// 于是 `CurrentGroupIndex > groups.Count` 成立 → 本层被误判成"全部完成"，
+    /// 而设备其实还没升级，重新上线后也不会再被下发（实测踩过这个坑）。
+    ///
+    /// 同样不能用"仍待升级的设备"来切：每完成一台就少一台，组边界会漂移。
     /// </summary>
     private async Task<List<string[]>> BuildLevelGroupsAsync(
         string agingNumber,
         OtaBatchState state,
         Dictionary<string, string> targets)
     {
-        var levelDevices = await _repository.GetMeshLevelDeviceIdsAsync(
-            agingNumber,
-            state.CurrentLevel);
+        var level = state.CurrentLevel;
 
-        var members = targets.Keys
-            .Where(levelDevices.Contains)
+        var members = await _repository.GetLevelMembersAsync(agingNumber, state.Seq, level);
+
+        if (members.Length == 0)
+        {
+            // 该层还没有快照：按「targets ∩ 实时层清单」建立一次并落库。
+            var levelDevices = await _repository.GetMeshLevelDeviceIdsAsync(agingNumber, level);
+
+            var snapshot = targets.Keys
+                .Where(levelDevices.Contains)
+                .OrderBy(deviceId => deviceId, StringComparer.Ordinal)
+                .ToArray();
+
+            if (snapshot.Length > 0)
+            {
+                await _repository.SetLevelMembersAsync(agingNumber, state.Seq, level, snapshot);
+
+                _logger.LogInformation(
+                    "OTA 建立第 {Level} 层成员快照，AgingNumber={AgingNumber}, Seq={Seq}, Members={MemberCount}",
+                    level,
+                    agingNumber,
+                    state.Seq,
+                    snapshot.Length);
+            }
+
+            members = snapshot;
+        }
+
+        var ordered = members
             .OrderBy(deviceId => deviceId, StringComparer.Ordinal)
             .ToArray();
 
-        // 第 2 层强制逐台（默认 1 台一组），其余层用 LevelGroupSize。
-        var groupSize = state.CurrentLevel == 2 ? _secondLevelGroupSize : _levelGroupSize;
+        // 第 2 层单独配（默认逐台），其余层用 LevelGroupSize。
+        var groupSize = level == 2 ? _secondLevelGroupSize : _levelGroupSize;
 
-        return members.Chunk(groupSize).ToList();
+        return ordered.Chunk(groupSize).ToList();
     }
 
     /// <summary>

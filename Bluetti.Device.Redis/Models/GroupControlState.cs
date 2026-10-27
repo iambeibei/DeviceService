@@ -78,6 +78,12 @@ public static class GroupControlRunExcludeReasons
 
     /// <summary>阶段倒计时到期仍未完成本阶段。</summary>
     public const string StageTimeout = "stage_timeout";
+
+    /// <summary>
+    /// start_aging 连续多次下发均未收到设备 cmd/reply，判定节点异常。
+    /// 与掉线不同，节点可能仍在线（在在线列表中）但指令通道已失效，因此不允许回归本批次。
+    /// </summary>
+    public const string StartAgingNoReply = "start_aging_no_reply";
 }
 
 public static class GroupControlRunStatuses

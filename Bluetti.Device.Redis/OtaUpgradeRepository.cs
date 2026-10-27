@@ -155,6 +155,36 @@ public sealed class OtaUpgradeRepository
         return raw.IsNullOrEmpty ? null : raw.ToString();
     }
 
+    /// <summary>
+    /// 写入本层的成员快照（进入该层时算一次）。已存在则追加，天然幂等。
+    /// 见 <see cref="RedisKeys.OtaBatchLevelMembers"/> 的注释：分组必须基于快照，
+    /// 否则设备掉线被移出实时层清单后，本层会被误判成"全部完成"。
+    /// </summary>
+    public async Task SetLevelMembersAsync(
+        string agingNumber,
+        long seq,
+        int level,
+        IEnumerable<string> deviceIds)
+    {
+        var key = RedisKeys.OtaBatchLevelMembers(agingNumber, seq, level);
+
+        var members = deviceIds
+            .Where(deviceId => !string.IsNullOrWhiteSpace(deviceId))
+            .Select(RedisKeys.Normalize)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (members.Length == 0)
+            return;
+
+        await _redis.SetAddAsync(key, members);
+        await _redis.KeyExpireAsync(key, RedisTtl.OtaBatch);
+    }
+
+    /// <summary>读取本层的成员快照；返回空数组表示该层尚未建立快照。</summary>
+    public async Task<string[]> GetLevelMembersAsync(string agingNumber, long seq, int level)
+        => await _redis.SetMembersAsync(RedisKeys.OtaBatchLevelMembers(agingNumber, seq, level));
+
     /// <summary>记录当前层已下发 ota 指令的设备。进入下一层时清空。</summary>
     public async Task AddDispatchedAsync(string agingNumber, long seq, string deviceId)
     {

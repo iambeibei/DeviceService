@@ -59,6 +59,10 @@ public sealed class RedisHelper
 
     public Task<bool> SetAddAsync(string key, string value) => _db.SetAddAsync(key, value);
 
+    /// <summary>批量写入 Set 成员，返回本次新增的个数（已存在的不会重复计数）。</summary>
+    public Task<long> SetAddAsync(string key, IEnumerable<string> values)
+        => _db.SetAddAsync(key, values.Select(value => (RedisValue)value).ToArray());
+
     public Task<bool> SetRemoveAsync(string key, string value) => _db.SetRemoveAsync(key, value);
 
     public async Task<string[]> SetMembersAsync(string key)

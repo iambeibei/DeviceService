@@ -126,6 +126,18 @@ public static class RedisKeys
         => $"{OtaBatchLevelRoot(agingNumber, seq, level)}:versions";
 
     /// <summary>
+    /// 本层的**成员快照**（进入该层时算一次并落库）。
+    ///
+    /// 为什么必须落库：分组的依据若每次按实时的 `lgw:ota:{架}:{层}` 清单重算，
+    /// 设备一掉线就会被移出该清单，成员数缩水甚至变 0，
+    /// 于是 `CurrentGroupIndex > groups.Count` 成立 → 本层被**误判成"全部完成"**，
+    /// 而设备其实还没升级，之后它重新上线也不会再被下发。
+    /// 用快照后，掉线设备只会停在 pending（继续等补发或等超时），不会把组数抹掉。
+    /// </summary>
+    public static string OtaBatchLevelMembers(string agingNumber, long seq, int level)
+        => $"{OtaBatchLevelRoot(agingNumber, seq, level)}:members";
+
+    /// <summary>
     /// 当前层已下发 ota 指令的设备集合，**进入下一层时清空**。
     /// 完成判定：集合里的设备在 targets 中全部变成 upgraded 即本层完成。
     /// 关键点是比对 targets 的**最新**状态而不是本层的确认记录——

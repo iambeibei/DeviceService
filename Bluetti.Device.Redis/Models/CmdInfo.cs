@@ -25,11 +25,19 @@ public sealed class CmdInfo
     public string? ReplyJson { get; set; }
 
     /// <summary>
-    /// 等待回复超时的重试次数。仅普通命令使用，start_aging **不重试**——
-    /// 超时只说明上位机没收到回复，不能证明 ESP32 没执行，重发会重复消耗 PN。
+    /// 已用掉的重发次数（总下发次数 = RetryCount + 1）。
+    /// 普通命令按 <c>CommandProcessing:TimeoutRetryCount</c> 限制；start_aging 按
+    /// <c>CommandProcessing:StartAgingMaxAttempts</c> 限制。
     /// 存在 Redis 命令 Hash 中，服务重启后不会重复计数。
     /// </summary>
     public int RetryCount { get; set; }
+
+    /// <summary>
+    /// 最近一次实际下发使用的 MQTT Seq。start_aging 每次重发都会分配新的下发 Seq，
+    /// 逻辑命令 Seq 保持不变，因此需要单独记录最后一次真正发出去的 Seq 便于排查。
+    /// 未重发过时等于 <see cref="Seq"/>。
+    /// </summary>
+    public long LastAttemptSeq { get; set; }
 
     [JsonIgnore]
     public string StatusKey => RedisKeys.DeviceCommandStatus(DeviceId, Seq);

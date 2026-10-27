@@ -35,11 +35,13 @@ dotnet run --project DeviceService        # 本地运行（连接 appsettings.js
 1. 平台写 Redis Stream `{Prefix}:cmd:queue`，字段名必须是 `data`；一条 Entry 的 `DeviceInfos` 可含多个 `{DeviceId, RecordId}`（批量）。
 2. `RedisCmdWorker` 以消费者组 `device-service` 消费，展开为单设备命令，按 DeviceId 投入各自的 Channel 串行队列（不同设备并行）：
    - 普通命令：收到回复或超时后立即处理下一条。
-   - `start_aging`：受 `AgingCommandGate` 门控，只有设备上报 `agingIdle / agingStop / agingError` 才放行下一条；`timed_out` 不释放门（超时只说明没等到回复，不能证明 ESP32 没执行）。
+   - `start_aging`：受 `AgingCommandGate` 门控，只有设备上报 `agingIdle / agingStop / agingError` 才放行下一条。**每次下发等待 `StartAgingReplyTimeoutSeconds`（默认 20s），超时未收到 `cmd/reply` 就用新的下发 Seq 重发，最多 `StartAgingMaxAttempts`（默认 5）次**；耗尽仍无任何回复则标 `failed`、释放发送门、写 `event:fault` 并剔除群控参与集合（判定节点异常）。**例外**：若设备此时已上报 `agingStart`（说明命令其实生效、只是回复丢了），则不判异常，命令只标 `timed_out` 且发送门继续保持。
 3. 每条命令发布 MQTT `server/{deviceId}/cmd/{action}`，payload 固定 `{Seq, Data}`——无参数时 `"Data": null` 也必须存在。`RecordId` 不进 MQTT payload，只存 Redis。
-4. 等四类回复主题 `device/{id}/cmd/reply/{point|state|pn|config}` 中匹配 `CmdSeq` 的回复落库，或超时标 `timed_out`，才处理同设备下一条；一条 Stream Entry 的所有设备子命令都结束后才 XACK。
+4. 等四类回复主题 `device/{id}/cmd/reply/{point|state|pn|config}` 中匹配 `CmdSeq` 的回复落库，或超时标 `timed_out`，才处理同设备下一条；一条 Stream Entry 的所有设备子命令都结束后才 XACK。`Code == 1` 才算成功（含固件"指令重复，老化已启动"这类幂等回复），其它 `Code` 一律 `failed`；`Msg` 不参与判定，只落库留痕。
 
 回复等待机制：进程内 `TaskCompletionSource` 唤醒 + 超时边界复查 Redis Hash（`CommandRepository.WaitForCompletionAsync`）。命令最终状态以 Redis Hash `{Prefix}:device:{id}:cmd:{seq}` 为准，不要只依赖内存通知。
+
+**`start_aging` 的两种 Seq 不能混用**：逻辑 Seq（Stream Entry 里那条）绑定 `CurrentAgingSeq`、群控 `RunSeq`、批次 ACK 与平台读取的命令 Hash，全程不变；下发 Seq 只在第 2 次起的重发时新分配，仅用于 MQTT 报文 `Seq` 与 `Data.CmdSeq` 回复匹配，每次尝试单独落一条 `cmd:{下发Seq}` 便于追溯。最终结果由 `CommandRepository.FinalizeAttemptsAsync` 回写到逻辑记录——它刻意不做终态保护（耗尽时要能把 `timed_out` 改成 `failed`），但**不会把 `completed` 降级**，用来兜住"更早某次尝试的迟到回复"。
 
 Action 与回复主题映射（`CommandReplyTypeResolver`）：`get_state` → `state`，`set_pn` → `pn`，`get_config` → `config`，其它 → `point`。
 
@@ -75,7 +77,8 @@ MQTT → Channel → `MqttMessageWorker` → Handler 写 Redis（最新值 Hash 
 - **OTA 分层升级**（`OtaUpgradeService`）：`Action=ota` 的批量指令分两种走向——**单设备直接按普通命令转发**（无 mesh 依赖，不管控）；**多设备由服务接管**（`RedisCmdWorker` 调 `TryTakeOverAsync` 后整条命令项 `MarkCompleted` 并 ACK，实际下发由服务后台调度）。架号取 `DeviceInfos[0]` 的 `runtime.AgingNumber`。
   - **任务表 = `DeviceInfos` ∩ 该架在线列表 `lgw:ota:{AgingNumber}`**（`DeviceRepository.GetOtaRackOnlineDeviceIdsAsync`）。为什么取交集：只用 `DeviceInfos` 会把离线设备算进来、白等一轮超时；只用在线列表会丢掉 `RecordId`（命令状态回写与老化关联都依赖它），还会升级平台没点名的设备。交集为空则**拒绝接管**。结果存 `lgw:ota:{架}:run:{seq}:targets`（Hash：deviceId → pending/upgraded/failed/skipped），RecordId 存 `:recordids`。
   - **完成判据 = 设备上报 OTACP（2026-10-22 变更）**：`device/{id}/event/OTACP`，`Data.IsComplete=1`，由 `Handlers/OtaCompletionHandler.cs` 解析后调 `OtaUpgradeService.MarkDeviceUpgradedAsync` 标 `upgraded`。**不再比对固件版本号**——新固件升级**不再重启**，版本号可能根本不变；`level:{层}:versions` 版本基线、`VerifyLevelAsync` 的版本比对、`VersionChanged` 全部已删除。OTACP **不携带 ota 指令 Seq**（payload 里的 `Seq` 是设备自己的消息序号），批次归属只能按 `deviceId` 反查该架活跃批次；`Data.AgingNumber` 会校验，非法则回退按 runtime 反查。**固件若不上报 OTACP，该设备必然超时标 failed。**
-  - **层内再分组（`LevelGroupSize`，当前 2 台；第 2 层用 `SecondLevelGroupSize`，当前 1 台 = 逐台串行）**：该层设备按组大小切成若干组，不足一组也单独成组。**第 2 层单独配 1**，因为第 2 层节点全部经根节点中继，并发下载会压垮根节点转发。**一组处理完才下发下一组，本层所有组处理完才进入下一层**。分组依据必须是「`targets` ∩ 该层清单」的**全量快照**按 DeviceId 排序（`BuildLevelGroupsAsync`），**不能用"仍待升级的设备"切**——后者每完成一台就少一台，组边界会漂移、组号指向错误设备。组号存在 `OtaBatchState.CurrentGroupIndex`（进新层重置为 1）。
+  - **层内再分组（`LevelGroupSize`，当前 2 台；第 2 层用 `SecondLevelGroupSize`，当前 2 台）**：该层设备按组大小切成若干组，不足一组也单独成组。**一组处理完才下发下一组，本层所有组处理完才进入下一层**。组号存在 `OtaBatchState.CurrentGroupIndex`（进新层重置为 1）。
+  - **分组必须基于落库的层成员快照（`lgw:ota:{架}:run:{seq}:level:{层}:members`，Set）**：进入该层时按「`targets` ∩ 实时层清单」算一次并写入，本层内所有判定都读它（`BuildLevelGroupsAsync`）。**两个坑都踩过**：① 用"仍待升级的设备"切 → 每完成一台就少一台，组边界漂移、组号指向错误设备；② **每次按实时 `lgw:ota:{架}:{层}` 清单重算** → 设备一掉线就被移出该清单（`MarkOfflineAsync` 会清 MeshLevel 条目），成员数缩水甚至变 0，`CurrentGroupIndex > groups.Count` 成立 → **本层被误判成"全部完成"**（日志表现：`本层 0 组全部处理完成`），设备其实没升级且重新上线后也不会再被下发。用快照后，掉线设备只会停在 `pending`，继续等补发或等超时。
   - **组完成判定**：该组成员在 `targets` 中**都不再是 `pending`**（即 upgraded / failed / skipped）即本组处理完 → `AdvanceGroupAsync` 组号 +1、状态回 `Pending`，并置 `GroupDelayUntilUtc = 现在 + GroupDelaySeconds`（当前 5 秒）。`StartLevelAsync` 下发下一组前会检查该时刻，**组间固定延时 5 秒**。本层所有组处理完后 `StartLevelAsync` 判定"组号超过组数"→ `CompleteLevelAsync` 走层间延时；**这条路径不受组间延时影响**（最后一组后面没有下一组，不额外等 5 秒）。`AdvanceLevelAsync` / `CompleteLevelAsync` / `FinishBatchAsync` 都会清 `GroupDelayUntilUtc`，新层第 1 组不继承上一层的延时。
   - **层间固定延时** `LevelStabilizeSeconds`（**当前 10s**）后进入下一层。**mesh 稳定计数判定已删除**（`ExpectedOnlineCount` 一并移除）：不重启就不会掉线、mesh 不会重组，在线数恒定，"回到基准即稳定"恒为真、等于没有。
   - **层内周期性补发（`ResendIntervalMinutes`，当前 5 分钟）**：当前小组有设备迟迟不上报 OTACP 时，每 5 分钟把升级指令**重发一次**（`ResendGroupAsync`），只发给**仍是 `pending`** 的设备（已 upgraded 的不重刷），离线的跳过并计数。补发**不改变 payload 的 `Seq`**（`BuildOtaPayload` 固定用 `state.Seq`），设备端可按 Seq 幂等去重。每次补发 `state.ResendCount++` 并落库，日志以 `OTA 补发第 N 次（第 X 层 a/b 组）` 明确标记；进入新小组时 `ResendCount` 清零、`NextResendUtc` 重置。补发一直持续到本组 30 分钟超时为止（按 5 分钟算，最多约 5~6 次）。
@@ -95,7 +98,7 @@ MQTT → Channel → `MqttMessageWorker` → Handler 写 Redis（最新值 Hash 
 
 ## 配置
 
-`CommandProcessing.ReplyTimeoutSeconds`（默认 15s）、`PublishRetryDelayMilliseconds`（默认 1000ms，同时是群控后台轮询间隔）、`GroupControlReleaseReplyTimeoutSeconds`（默认 15s，单台放行回复等待）、`StartAgingStaggerMilliseconds`（默认 0 = 不间隔）在 `appsettings.json` 中调整；消费组内 Consumer 名取 `RedisSettings:ConsumerName`，缺省为本机名。
+`CommandProcessing.ReplyTimeoutSeconds`（默认 15s）、`PublishRetryDelayMilliseconds`（默认 1000ms，同时是群控后台轮询间隔）、`GroupControlReleaseReplyTimeoutSeconds`（默认 15s，单台放行回复等待）、`StartAgingStaggerMilliseconds`（默认 0 = 不间隔）、`StartAgingReplyTimeoutSeconds`（默认 20s，start_aging 单次等待回复超时）、`StartAgingMaxAttempts`（默认 5，start_aging 总下发次数含首次，1 = 不重发）、`StartAgingRetryDelayMilliseconds`（默认 1000ms，两次下发间隔，0 = 不间隔）在 `appsettings.json` 中调整；消费组内 Consumer 名取 `RedisSettings:ConsumerName`，缺省为本机名。
 
 **批量 `start_aging` 的错峰下发**：不同设备的命令队列是并行消费的，入队即意味着马上发布，因此同批指令默认会在同一瞬间打到整架设备。`StartAgingStaggerMilliseconds`（当前配 100）让 `DispatchBatchAsync` 在同一条批量指令内按顺序间隔入队，只对 `start_aging` 生效、最后一台后面不再等待。注意该延迟施加在 Stream 消费主循环里，**会阻塞新命令读取 N×间隔毫秒**（30 台约 3 秒）；已在各设备队列中的命令和 MQTT 上行不受影响。填 0 即恢复"无间隔并行下发"。
 

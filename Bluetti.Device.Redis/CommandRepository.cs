@@ -289,6 +289,105 @@ public sealed class CommandRepository
     }
 
     /// <summary>
+    /// 为 start_aging 的每次重发分配一个新的下发 Seq（只取号，不写 Stream）。
+    ///
+    /// 必须复用 lgw:cmd:seq 同一计数器：另开计数器可能与该计数器未来产生的命令 Seq 撞号，
+    /// 导致 lgw:device:{id}:cmd:{seq} 命令 Hash 互相覆盖。
+    /// 副作用：计数器里并非每个 Seq 都有对应的 Stream Entry，排查时不要假设一一对应。
+    /// </summary>
+    public Task<long> NextAttemptSeqAsync()
+        => _redis.NextSequenceAsync(RedisKeys.CommandSequence);
+
+    /// <summary>
+    /// 记录 start_aging 的重发进度：已用重发次数与最后一次实际下发 Seq，不改动 Status。
+    /// 只写这两个字段而不是整对象回写，避免覆盖并发的 CompleteAsync 状态。
+    /// </summary>
+    public async Task UpdateAttemptProgressAsync(
+        string deviceId,
+        long logicalSeq,
+        int attemptIndex,
+        long attemptSeq)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+        if (logicalSeq <= 0)
+            throw new ArgumentOutOfRangeException(nameof(logicalSeq), "命令序号必须大于 0");
+        if (attemptIndex <= 0)
+            throw new ArgumentOutOfRangeException(nameof(attemptIndex), "尝试序号必须大于 0");
+
+        var key = RedisKeys.DeviceCommandStatus(deviceId, logicalSeq);
+        var exists = await _redis.HashGetAsync(key, nameof(CmdInfo.Seq));
+        if (exists.IsNullOrEmpty)
+            return;
+
+        await _redis.HashSetAsync(
+            key,
+            [
+                new HashEntry(nameof(CmdInfo.RetryCount), Math.Max(0, attemptIndex - 1)),
+                new HashEntry(nameof(CmdInfo.LastAttemptSeq), attemptSeq)
+            ]);
+    }
+
+    /// <summary>
+    /// 把 start_aging 多次下发中最后一次的结果回写到“逻辑命令记录”（Stream 里那条 Seq 对应的 Hash）。
+    ///
+    /// 为什么需要回写：重发使用新的下发 Seq（CmdSeq 每次不同，回复才能精确关联），
+    /// 但 CurrentAgingSeq、群控 RunSeq、批次 ACK 都绑定最初那条逻辑 Seq，平台也只读逻辑记录，
+    /// 因此最终结论必须落到逻辑 Seq 上。
+    ///
+    /// 注意两点：
+    /// 1. 刻意不做终态保护——耗尽重发时逻辑记录已是 timed_out，必须能改成 failed；
+    /// 2. 但 completed 不能被降级：更早某次尝试的迟到回复可能已把逻辑记录写成 completed，
+    ///    此时即使最后一次尝试超时，也必须保留 completed。
+    /// </summary>
+    public async Task<CmdInfo> FinalizeAttemptsAsync(
+        string deviceId,
+        long logicalSeq,
+        CmdInfo finalAttempt,
+        int attempts,
+        string? exhaustedReason)
+    {
+        ArgumentNullException.ThrowIfNull(finalAttempt);
+
+        deviceId = RedisKeys.Normalize(deviceId);
+        if (logicalSeq <= 0)
+            throw new ArgumentOutOfRangeException(nameof(logicalSeq), "命令序号必须大于 0");
+        if (attempts <= 0)
+            throw new ArgumentOutOfRangeException(nameof(attempts), "下发次数必须大于 0");
+
+        var key = RedisKeys.DeviceCommandStatus(deviceId, logicalSeq);
+        var existing = await _redis.HashToObjectAsync<CmdInfo>(key) ?? new CmdInfo
+        {
+            Seq = logicalSeq,
+            DeviceId = deviceId,
+            CreatedAtUtc = DateTime.UtcNow
+        };
+
+        var keepCompleted =
+            string.Equals(existing.Status, CommandStates.Completed, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(finalAttempt.Status, CommandStates.Completed, StringComparison.OrdinalIgnoreCase);
+
+        if (!keepCompleted)
+        {
+            existing.Status = exhaustedReason is not null ? CommandStates.Failed : finalAttempt.Status;
+            existing.ResultCode = finalAttempt.ResultCode;
+            existing.ResultMessage = exhaustedReason ?? finalAttempt.ResultMessage;
+            existing.ReplyType = finalAttempt.ReplyType;
+            existing.ReplyJson = finalAttempt.ReplyJson;
+            existing.TimedOutAtUtc = finalAttempt.TimedOutAtUtc;
+            existing.CompletedAtUtc = CommandStates.IsTerminal(existing.Status)
+                ? finalAttempt.CompletedAtUtc ?? DateTime.UtcNow
+                : null;
+        }
+
+        existing.RetryCount = Math.Max(0, attempts - 1);
+        existing.LastAttemptSeq = finalAttempt.Seq;
+        await _redis.ObjectToHashAsync(key, existing, CommandTtl);
+
+        SignalCompletion(existing);
+        return existing;
+    }
+
+    /// <summary>
     /// 等待对应 DeviceId + CmdSeq 的设备回复。
     /// 处理器完成 Redis 落库后会直接唤醒等待任务；同时在注册等待器后再次读取 Redis，
     /// 避免“回复刚好发生在注册瞬间”导致漏通知。

@@ -694,6 +694,120 @@ public sealed class GroupControlService : BackgroundService
     }
 
     /// <summary>
+    /// start_aging 连续多次下发都收不到设备 cmd/reply 时调用：判定该节点指令通道异常。
+    ///
+    /// 做两件事：
+    /// 1. 写 event:fault（最新值 Hash + 历史 Stream）并 publish event:fault，供平台与运维感知；
+    /// 2. 若设备属于当前 mode=2 群控批次的参与集合，立即剔除。
+    ///    这一步必须做：RegisterAgingBatchAsync 在下发前就把设备登记进 participants，
+    ///    失败设备若不移除，批次激活后会永久阻塞整架阶段放行屏障。
+    ///
+    /// 与 HandleDeviceOfflineAsync 的区别：设备可能仍在线（仍在 lgw:devices:online 中），
+    /// 只是指令通道失效，因此剔除原因用 start_aging_no_reply，且不允许回归本批次。
+    /// </summary>
+    public async Task HandleStartAgingNoReplyAsync(string deviceId, long seq, string message)
+    {
+        deviceId = RedisKeys.Normalize(deviceId);
+        message ??= string.Empty;
+
+        var agingNumber = string.Empty;
+        long? runSeq = null;
+        var excluded = false;
+        var faultWritten = false;
+
+        var device = await _devices.GetAsync(deviceId);
+        if (device is not null &&
+            string.Equals(device.DeviceType, "1", StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(device.AgingNumber))
+        {
+            try
+            {
+                agingNumber = RedisKeys.NormalizeAgingNumber(device.AgingNumber);
+            }
+            catch (ArgumentException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "设备架号非法，跳过群控剔除，DeviceId={DeviceId}, AgingNumber={AgingNumber}",
+                    deviceId,
+                    device.AgingNumber);
+            }
+
+            if (agingNumber.Length > 0)
+            {
+                var rackLock = GetRackLock(agingNumber);
+                await rackLock.WaitAsync();
+                try
+                {
+                    var state = await GetStateUnsafeAsync(agingNumber);
+                    if (state.Mode == 2 && state.CurrentRunSeq.HasValue)
+                    {
+                        var currentRunSeq = state.CurrentRunSeq.Value;
+                        var participants = await _repository.GetRunParticipantsAsync(agingNumber, currentRunSeq);
+                        if (participants.Contains(deviceId))
+                        {
+                            runSeq = currentRunSeq;
+
+                            await ExcludeParticipantUnsafeAsync(
+                                agingNumber,
+                                currentRunSeq,
+                                deviceId,
+                                GroupControlRunExcludeReasons.StartAgingNoReply,
+                                message,
+                                state.CurrentStage);
+
+                            excluded = true;
+
+                            // ExcludeParticipantUnsafeAsync 在 RaiseFaultOnExclusion 打开时已经写过故障，
+                            // 避免同一次异常留下两条 event:fault。
+                            faultWritten = _raiseFaultOnExclusion;
+
+                            // 兜底：参与集合被清空后既不会放行也不会结束，直接收尾。
+                            var remaining = await _repository.GetRunParticipantsAsync(agingNumber, currentRunSeq);
+                            if (remaining.Count == 0)
+                            {
+                                await FinishRunUnsafeAsync(
+                                    agingNumber,
+                                    state,
+                                    currentRunSeq,
+                                    "参与设备已全部因 start_aging 无回复移出");
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    rackLock.Release();
+                }
+            }
+        }
+
+        if (!faultWritten)
+        {
+            var payload = BuildGroupControlFaultPayload(
+                agingNumber,
+                runSeq ?? 0,
+                deviceId,
+                GroupControlRunExcludeReasons.StartAgingNoReply,
+                message,
+                seq);
+
+            await _devices.SaveGroupControlFaultAsync(deviceId, seq, message, payload);
+            await PublishFaultAsync(deviceId, message);
+        }
+
+        _logger.LogError(
+            "start_aging 连续下发无回复，节点判定异常，AgingNumber={AgingNumber}, RunSeq={RunSeq}, DeviceId={DeviceId}, Seq={Seq}, Excluded={Excluded}, FaultWritten={FaultWritten}, Message={Message}",
+            agingNumber.Length == 0 ? "<empty>" : agingNumber,
+            runSeq?.ToString() ?? "<empty>",
+            deviceId,
+            seq,
+            excluded,
+            faultWritten,
+            message);
+    }
+
+    /// <summary>
     /// 点位或总控的架号/在线状态改变后，只重新评估受影响的老化架。
     /// </summary>
     public async Task ReevaluateMembershipAsync(

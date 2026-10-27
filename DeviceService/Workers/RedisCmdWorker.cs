@@ -36,6 +36,9 @@ public sealed class RedisCmdWorker : BackgroundService
     private readonly TimeSpan _replyTimeout;
     private readonly TimeSpan _publishRetryDelay;
     private readonly TimeSpan _startAgingStagger;
+    private readonly TimeSpan _startAgingReplyTimeout;
+    private readonly int _startAgingMaxAttempts;
+    private readonly TimeSpan _startAgingRetryDelay;
     private readonly int _timeoutRetryCount;
 
     private readonly ConcurrentDictionary<string, DeviceCommandQueue> _deviceQueues =
@@ -84,11 +87,35 @@ public sealed class RedisCmdWorker : BackgroundService
                 "CommandProcessing:StartAgingStaggerMilliseconds 不能为负数");
         _startAgingStagger = TimeSpan.FromMilliseconds(staggerMilliseconds);
 
-        // 等待回复超时后的重试次数。0 = 关闭（恢复原有行为）。
-        // start_aging 永远不重试（见 ProcessOneCommandAsync 的 allowTimeoutRetry）。
+        // 等待回复超时后的重试次数（普通命令）。0 = 关闭。
+        // start_aging 走独立的重发流程，见 SendStartAgingWithAttemptsAsync。
         var timeoutRetry = configuration.GetValue<int?>(
             "CommandProcessing:TimeoutRetryCount") ?? 1;
         _timeoutRetryCount = timeoutRetry > 0 ? timeoutRetry : 0;
+
+        // start_aging 专用等待回复超时。与普通命令分离，避免拉长所有命令的等待时间。
+        var startAgingTimeoutSeconds = configuration.GetValue<double?>(
+            "CommandProcessing:StartAgingReplyTimeoutSeconds") ?? 20;
+        if (startAgingTimeoutSeconds <= 0)
+            throw new InvalidOperationException(
+                "CommandProcessing:StartAgingReplyTimeoutSeconds 必须大于 0");
+        _startAgingReplyTimeout = TimeSpan.FromSeconds(startAgingTimeoutSeconds);
+
+        // start_aging 的总下发次数（含首次）。1 = 不重发，等价于改造前的行为。
+        var startAgingMaxAttempts = configuration.GetValue<int?>(
+            "CommandProcessing:StartAgingMaxAttempts") ?? 5;
+        if (startAgingMaxAttempts < 1)
+            throw new InvalidOperationException(
+                "CommandProcessing:StartAgingMaxAttempts 必须大于等于 1");
+        _startAgingMaxAttempts = startAgingMaxAttempts;
+
+        // 两次下发之间的间隔，0 = 不间隔。
+        var startAgingRetryDelayMs = configuration.GetValue<int?>(
+            "CommandProcessing:StartAgingRetryDelayMilliseconds") ?? 1000;
+        if (startAgingRetryDelayMs < 0)
+            throw new InvalidOperationException(
+                "CommandProcessing:StartAgingRetryDelayMilliseconds 不能为负数");
+        _startAgingRetryDelay = TimeSpan.FromMilliseconds(startAgingRetryDelayMs);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -485,7 +512,7 @@ public sealed class RedisCmdWorker : BackgroundService
                         reservationHeldByThisItem = true;
                     }
 
-                    var result = await ProcessOneCommandAsync(
+                    var result = await SendStartAgingWithAttemptsAsync(
                         deviceId,
                         item,
                         ct,
@@ -494,17 +521,16 @@ public sealed class RedisCmdWorker : BackgroundService
                             // MQTT Publish 真正成功后，这条 Seq 已不再属于“未运行任务”。
                             await _devices.RemovePendingAgingTaskAsync(deviceId, item.Command.Seq);
                             await _devices.SetCurrentAgingTaskIdAsync(deviceId, item.Command.Seq, item.Command.RecordId);
-                        },
-                        allowTimeoutRetry: false);
+                        });
 
-                    // start_aging 的发送门只在以下两种情况下释放：
-                    // 1. 下位机明确回复失败（failed）；
-                    // 2. 后续 state 事件上报 agingIdle / agingStop / agingError。
+                    // start_aging 的发送门只在以下三种情况下释放：
+                    // 1. 下位机明确回复失败（failed，含 Code != 1 的业务失败）；
+                    // 2. 连续 StartAgingMaxAttempts 次下发都收不到 cmd/reply，判定节点异常（failed）；
+                    // 3. 后续 state 事件上报 agingIdle / agingStop / agingError。
                     //
-                    // 特别注意：timed_out 仅表示规定时间内没有收到 cmd/reply，不能证明 ESP32
-                    // 没有收到或没有执行这条 start_aging。因此 timed_out 仍保留 CurrentAgingSeq
-                    // 和发送门，第二/第三条 start_aging 继续在 TaskQueue 中等待。
-                    if (string.Equals(result.Status, CommandStates.Failed, StringComparison.OrdinalIgnoreCase))
+                    // 特别注意：单纯的 timed_out（设备已上报 agingStart，只是回复丢了）仍保留
+                    // CurrentAgingSeq 和发送门，第二/第三条 start_aging 继续在 TaskQueue 中等待。
+                    if (string.Equals(result.Command.Status, CommandStates.Failed, StringComparison.OrdinalIgnoreCase))
                     {
                         await _agingGate.ReleaseAfterCommandFailureAsync(deviceId, ct);
                         reservationHeldByThisItem = false;
@@ -512,14 +538,48 @@ public sealed class RedisCmdWorker : BackgroundService
                         var stateAfterFailure = await _agingGate.GetAgingStateAsync(deviceId, ct);
                         if (!IsAgingStartState(stateAfterFailure))
                             await _devices.ClearCurrentAgingTaskIdAsync(deviceId);
+
+                        // 只有“耗尽重发且始终没有任何回复”才判节点异常；
+                        // 设备明确回复 Code != 1 属于业务失败，只释放门、不记节点故障。
+                        if (result.NodeFault)
+                        {
+                            var faultMessage = result.Command.ResultMessage
+                                ?? "start_aging 连续下发未收到设备回复，判定节点异常";
+
+                            _logger.LogError(
+                                "start_aging 连续 {Attempts} 次下发均未收到 cmd/reply，判定节点异常并取消下发，DeviceId={DeviceId}, LogicalSeq={LogicalSeq}, AttemptSeqs={AttemptSeqs}",
+                                result.Attempts,
+                                deviceId,
+                                item.Command.Seq,
+                                string.Join(',', result.AttemptSeqs));
+
+                            // 幂等兜底：发布成功时已出队，异常路径可能残留。
+                            await _devices.RemovePendingAgingTaskAsync(deviceId, item.Command.Seq);
+                            await _groupControl.HandleStartAgingNoReplyAsync(deviceId, item.Command.Seq, faultMessage);
+                        }
                     }
-                    else if (string.Equals(result.Status, CommandStates.TimedOut, StringComparison.OrdinalIgnoreCase))
+                    else if (string.Equals(result.Command.Status, CommandStates.TimedOut, StringComparison.OrdinalIgnoreCase))
                     {
                         _logger.LogWarning(
-                            "start_aging 在 {TimeoutSeconds}s 内未收到 cmd/reply，命令标记 timed_out，但老化发送门继续保持；后续 start_aging 将等待 agingIdle/agingStop/agingError，DeviceId={DeviceId}, Seq={Seq}",
-                            _replyTimeout.TotalSeconds,
+                            "start_aging 连续 {Attempts} 次下发均未收到 cmd/reply，但设备已上报 agingStart，命令标记 timed_out，老化发送门继续保持；后续 start_aging 将等待 agingIdle/agingStop/agingError，DeviceId={DeviceId}, Seq={Seq}, AttemptSeqs={AttemptSeqs}",
+                            result.Attempts,
                             deviceId,
-                            item.Command.Seq);
+                            item.Command.Seq,
+                            string.Join(',', result.AttemptSeqs));
+                    }
+                    else if (string.Equals(result.Command.Status, CommandStates.Completed, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Code == 1 包含固件“指令重复，老化已启动”这类幂等回复，一律视为已送达。
+                        // 此时发送门必须保持关闭：设备正在老化，下一条 start_aging 继续排队。
+                        var stateAfterCompleted = await _agingGate.GetAgingStateAsync(deviceId, ct);
+                        _logger.LogInformation(
+                            "start_aging 已被设备确认，发送门保持关闭等待老化结束，DeviceId={DeviceId}, Seq={Seq}, Attempts={Attempts}, Code={Code}, Msg={Msg}, AgingState={AgingState}",
+                            deviceId,
+                            item.Command.Seq,
+                            result.Attempts,
+                            result.Command.ResultCode,
+                            result.Command.ResultMessage ?? "<null>",
+                            stateAfterCompleted ?? "<empty>");
                     }
 
                     break;
@@ -541,6 +601,230 @@ public sealed class RedisCmdWorker : BackgroundService
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// start_aging 的多次下发流程：每次尝试使用独立的 MQTT Seq，超时未收到 cmd/reply 就重发，
+    /// 达到 StartAgingMaxAttempts 仍无回复则本次下发失败。
+    ///
+    /// Seq 归属（改这里必须同时理解）：
+    /// - 逻辑 Seq（item.Command.Seq）：Stream Entry 的身份，绑定 CurrentAgingSeq、群控 RunSeq、
+    ///   批次 ACK 以及平台读取的命令 Hash，全程不变；
+    /// - 下发 Seq（attempt.Seq）：仅第 1 次复用逻辑 Seq，第 2 次起新分配，
+    ///   只用于 MQTT 报文 Seq 与 Data.CmdSeq 回复匹配，每次尝试单独落一条命令 Hash 便于追溯。
+    /// 因此 CurrentAgingSeq 绝不能被写成下发 Seq，否则 RecordId 关联与群控 RunSeq 都会错位。
+    /// </summary>
+    private async Task<StartAgingAttemptResult> SendStartAgingWithAttemptsAsync(
+        string deviceId,
+        QueuedCommand item,
+        CancellationToken ct,
+        Func<Task>? onPublished)
+    {
+        var logical = item.Command;
+        var attemptSeqs = new List<long>(_startAgingMaxAttempts);
+        var attempt = logical;
+        var attempts = 0;
+        var exhausted = false;
+
+        // 逻辑记录必须在第一次下发前就存在：迟到回复、CurrentAgingSeq → RecordId 关联都依赖它。
+        await _commands.EnsureStoredAsync(logical);
+
+        for (var attemptIndex = 1; attemptIndex <= _startAgingMaxAttempts; attemptIndex++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var attemptSeq = attemptIndex == 1
+                ? logical.Seq
+                : await _commands.NextAttemptSeqAsync();
+
+            attempt = new CmdInfo
+            {
+                Seq = attemptSeq,
+                DeviceId = logical.DeviceId,
+                RecordId = logical.RecordId,
+                Action = logical.Action,
+                Data = logical.Data?.DeepClone(),
+                Status = CommandStates.Queued,
+                ExpectedReplyType = logical.ExpectedReplyType,
+                CreatedAtUtc = logical.CreatedAtUtc == default ? DateTime.UtcNow : logical.CreatedAtUtc,
+                RetryCount = attemptIndex - 1,
+                LastAttemptSeq = attemptSeq
+            };
+
+            attemptSeqs.Add(attemptSeq);
+            attempts = attemptIndex;
+
+            // 与 ProcessOneCommandAsync 一致：先成功交给 Broker，再写 published。
+            // 发布失败（未连接 / Broker 拒绝）沿用无限重试，不计入下发次数。
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    await _commands.EnsureStoredAsync(attempt);
+                    await PublishCommandAsync(attempt, ct);
+
+                    // 只有第一次下发才更新 TaskQueue / CurrentAgingSeq；
+                    // 后续重发必须沿用逻辑 Seq，不能改写 CurrentAgingSeq。
+                    if (attemptIndex == 1 && onPublished is not null)
+                        await onPublished();
+
+                    await _commands.MarkPublishedAsync(attempt);
+                    break;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    await _commands.MarkQueuedAsync(attempt, ex.Message);
+
+                    _logger.LogWarning(
+                        ex,
+                        "start_aging MQTT 发布失败，将重试本次尝试，DeviceId={DeviceId}, Attempt={Attempt}/{MaxAttempts}, Seq={Seq}, RetryAfterMs={RetryAfterMs}",
+                        deviceId,
+                        attemptIndex,
+                        _startAgingMaxAttempts,
+                        attemptSeq,
+                        _publishRetryDelay.TotalMilliseconds);
+
+                    await Task.Delay(_publishRetryDelay, ct);
+                }
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            await _commands.UpdateAttemptProgressAsync(deviceId, logical.Seq, attemptIndex, attemptSeq);
+
+            _logger.LogInformation(
+                "start_aging 已下发，等待设备回复，DeviceId={DeviceId}, Attempt={Attempt}/{MaxAttempts}, LogicalSeq={LogicalSeq}, AttemptSeq={AttemptSeq}, TimeoutSeconds={TimeoutSeconds}",
+                deviceId,
+                attemptIndex,
+                _startAgingMaxAttempts,
+                logical.Seq,
+                attemptSeq,
+                _startAgingReplyTimeout.TotalSeconds);
+
+            var reply = await _commands.WaitForCompletionAsync(
+                deviceId,
+                attemptSeq,
+                _startAgingReplyTimeout,
+                ct);
+
+            if (reply is not null)
+            {
+                _logger.LogInformation(
+                    "start_aging 收到设备回复，DeviceId={DeviceId}, Attempt={Attempt}/{MaxAttempts}, AttemptSeq={AttemptSeq}, Status={Status}, Code={Code}, Msg={Msg}",
+                    deviceId,
+                    attemptIndex,
+                    _startAgingMaxAttempts,
+                    attemptSeq,
+                    reply.Status,
+                    reply.ResultCode,
+                    reply.ResultMessage);
+
+                return await FinalizeStartAgingAttemptsAsync(
+                    deviceId, item, reply, attempts, exhausted: false, attemptSeqs, ct);
+            }
+
+            attempt = await _commands.MarkTimedOutAsync(attempt, _startAgingReplyTimeout);
+
+            // 超时落库之前回复可能已经到达：MarkTimedOutAsync 有终态保护，会原样返回真实结果。
+            if (!string.Equals(attempt.Status, CommandStates.TimedOut, StringComparison.OrdinalIgnoreCase))
+            {
+                return await FinalizeStartAgingAttemptsAsync(
+                    deviceId, item, attempt, attempts, exhausted: false, attemptSeqs, ct);
+            }
+
+            // 更早某次尝试的迟到回复可能已经写进逻辑记录（completed / failed）。
+            // 命中就必须停止重发，否则后续下发会覆盖掉设备的真实答复。
+            var logicalNow = await _commands.GetAsync(deviceId, logical.Seq);
+            if (logicalNow is not null &&
+                CommandStates.IsTerminal(logicalNow.Status) &&
+                !string.Equals(logicalNow.Status, CommandStates.TimedOut, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "start_aging 重发期间收到更早尝试的迟到回复，停止重发，DeviceId={DeviceId}, LogicalSeq={LogicalSeq}, Status={Status}",
+                    deviceId,
+                    logical.Seq,
+                    logicalNow.Status);
+
+                return await FinalizeStartAgingAttemptsAsync(
+                    deviceId, item, logicalNow, attempts, exhausted: false, attemptSeqs, ct);
+            }
+
+            if (attemptIndex >= _startAgingMaxAttempts)
+            {
+                exhausted = true;
+                break;
+            }
+
+            _logger.LogWarning(
+                "start_aging 在 {TimeoutSeconds}s 内未收到 cmd/reply，准备第 {NextAttempt} 次下发，DeviceId={DeviceId}, LogicalSeq={LogicalSeq}, AttemptSeq={AttemptSeq}",
+                _startAgingReplyTimeout.TotalSeconds,
+                attemptIndex + 1,
+                deviceId,
+                logical.Seq,
+                attemptSeq);
+
+            if (_startAgingRetryDelay > TimeSpan.Zero)
+                await Task.Delay(_startAgingRetryDelay, ct);
+        }
+
+        return await FinalizeStartAgingAttemptsAsync(
+            deviceId, item, attempt, attempts, exhausted, attemptSeqs, ct);
+    }
+
+    /// <summary>
+    /// 把多次下发的结果落到逻辑命令记录，并按设备当前老化状态决定是否判定节点异常。
+    /// 设备若已上报 agingStart，说明命令其实生效、只是回复丢了，此时绝不能判异常，
+    /// 否则会重复下发并在已有老化任务上再次启动老化。
+    /// </summary>
+    private async Task<StartAgingAttemptResult> FinalizeStartAgingAttemptsAsync(
+        string deviceId,
+        QueuedCommand item,
+        CmdInfo finalResult,
+        int attempts,
+        bool exhausted,
+        IReadOnlyList<long> attemptSeqs,
+        CancellationToken ct)
+    {
+        string? exhaustedReason = null;
+
+        if (exhausted)
+        {
+            var agingState = await _agingGate.GetAgingStateAsync(deviceId, ct);
+            if (IsAgingStartState(agingState))
+            {
+                _logger.LogWarning(
+                    "start_aging 连续 {Attempts} 次下发均未收到 cmd/reply，但设备已上报 agingStart，视为命令已生效，不判节点异常；保持发送门等待 agingIdle/agingStop/agingError，DeviceId={DeviceId}, LogicalSeq={LogicalSeq}, AttemptSeqs={AttemptSeqs}",
+                    attempts,
+                    deviceId,
+                    item.Command.Seq,
+                    string.Join(',', attemptSeqs));
+            }
+            else
+            {
+                exhaustedReason =
+                    $"start_aging 连续 {attempts} 次下发（Seq={string.Join(',', attemptSeqs)}）均未收到 cmd/reply（每次 {_startAgingReplyTimeout.TotalSeconds:0.###}s），判定节点异常";
+            }
+        }
+
+        var finalized = await _commands.FinalizeAttemptsAsync(
+            deviceId,
+            item.Command.Seq,
+            finalResult,
+            attempts,
+            exhaustedReason);
+
+        await CompleteBatchItemAsync(item.Batch, deviceId, item.Command.Seq);
+        LogTerminalResult(finalized);
+
+        return new StartAgingAttemptResult(
+            finalized,
+            attempts,
+            NodeFault: exhaustedReason is not null,
+            attemptSeqs);
     }
 
     /// <summary>
@@ -846,6 +1130,16 @@ public sealed class RedisCmdWorker : BackgroundService
     }
 
     private sealed record QueuedCommand(BatchAckTracker Batch, CmdInfo Command);
+
+    /// <summary>
+    /// start_aging 多次下发的最终结果。
+    /// <paramref name="NodeFault"/> 为 true 表示“耗尽下发次数且设备始终没有任何回复”，需要判定节点异常。
+    /// </summary>
+    private sealed record StartAgingAttemptResult(
+        CmdInfo Command,
+        int Attempts,
+        bool NodeFault,
+        IReadOnlyList<long> AttemptSeqs);
 
     private sealed record DeviceCommandQueue(
         Channel<QueuedCommand> Channel,
